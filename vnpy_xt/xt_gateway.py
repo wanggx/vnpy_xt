@@ -129,6 +129,7 @@ class XtGateway(BaseGateway):
     default_name: str = "XT"
 
     default_setting: dict[str, Any] = {
+        "行情连接": ["客户端", "Token"],
         "token": "",
         "股票市场": ["是", "否"],
         "期货市场": ["是", "否"],
@@ -165,16 +166,18 @@ class XtGateway(BaseGateway):
     def _connect(self, setting: dict) -> None:
         """连接交易接口"""
         token: str = setting["token"]
+        client_mode: bool = setting.get("行情连接", "Token") == "客户端" or not token
 
         stock_active: bool = setting["股票市场"] == "是"
         futures_active: bool = setting["期货市场"] == "是"
         option_active: bool = setting["期权市场"] == "是"
 
-        self.md_api.connect(token, stock_active, futures_active, option_active)
+        self.md_api.connect(token, stock_active, futures_active, option_active, client_mode)
 
         self.trading = setting["仿真交易"] == "是"
         if self.trading:
-            path: str = setting["QMT路径"] + "\\userdata"
+            path: str = setting["QMT路径"]
+            self.write_log(f"QMT路径: {path}")
 
             accountid: str = setting["资金账号"]
 
@@ -195,6 +198,7 @@ class XtGateway(BaseGateway):
         if self.trading:
             return self.td_api.send_order(req)
         else:
+            self.write_log("委托失败，交易功能未启用")
             return ""
 
     def cancel_order(self, req: CancelRequest) -> None:
@@ -260,11 +264,15 @@ class XtMdApi:
 
         self.inited: bool = False
         self.subscribed: set = set()
+        self.last_volume: dict[str, float] = {}
 
         self.token: str = ""
+        self.client_mode: bool = False
         self.stock_active: bool = False
         self.futures_active: bool = False
         self.option_active: bool = False
+
+        xtdata.enable_hello = False
 
     def onMarketData(self, data: dict) -> None:
         """行情推送回调"""
@@ -285,6 +293,11 @@ class XtMdApi:
 
                 contract = symbol_contract_map[tick.vt_symbol]
                 tick.name = contract.name
+
+                previous_volume: float | None = self.last_volume.get(tick.vt_symbol)
+                self.last_volume[tick.vt_symbol] = tick.volume
+                if previous_volume is not None:
+                    tick.last_volume = max(tick.volume - previous_volume, 0)
 
                 bp_data: list = d["bidPrice"]
                 ap_data: list = d["askPrice"]
@@ -344,12 +357,17 @@ class XtMdApi:
         token: str,
         stock_active: bool,
         futures_active: bool,
-        option_active: bool
+        option_active: bool,
+        client_mode: bool = False
     ) -> None:
         """连接"""
-        self.gateway.write_log("开始启动行情服务，请稍等")
+        if client_mode:
+            self.gateway.write_log("开始连接本地QMT行情服务，请稍等")
+        else:
+            self.gateway.write_log("开始启动行情服务，请稍等")
 
         self.token = token
+        self.client_mode = client_mode
         self.stock_active = stock_active
         self.futures_active = futures_active
         self.option_active = option_active
@@ -359,7 +377,8 @@ class XtMdApi:
             return
 
         try:
-            self.init_xtdc()
+            if not self.client_mode:
+                self.init_xtdc()
 
             # 尝试查询合约信息，确认连接成功
             xtdata.get_instrument_detail("000001.SZ")
@@ -819,7 +838,7 @@ class XtTdApi(XtQuantTraderCallback):
         # 建立交易连接，返回0表示连接成功
         connect_result: int = self.xt_client.connect()
         if connect_result:
-            self.gateway.write_log("交易接口连接失败")
+            self.gateway.write_log("交易接口连接失败" + str(connect_result))
             return connect_result
 
         self.connected = True
@@ -853,6 +872,10 @@ class XtTdApi(XtQuantTraderCallback):
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
+        if not self.connected:
+            self.gateway.write_log("委托失败，交易接口尚未连接")
+            return ""
+
         contract: ContractData = symbol_contract_map.get(req.vt_symbol, None)
         if not contract:
             self.gateway.write_log(f"找不到该合约{req.vt_symbol}")
@@ -882,21 +905,29 @@ class XtTdApi(XtQuantTraderCallback):
 
         orderid: str = self.new_orderid()
 
-        self.xt_client.order_stock_async(
-            account=self.xt_account,
-            stock_code=stock_code,
-            order_type=DIRECTION_VT2XT[xt_direction],
-            order_volume=int(req.volume),
-            price_type=ORDERTYPE_VT2XT[(req.exchange, req.type)],
-            price=req.price,
-            strategy_name=req.reference,
-            order_remark=orderid
-        )
+        try:
+            self.xt_client.order_stock_async(
+                account=self.xt_account,
+                stock_code=stock_code,
+                order_type=DIRECTION_VT2XT[xt_direction],
+                order_volume=int(req.volume),
+                price_type=ORDERTYPE_VT2XT[(req.exchange, req.type)],
+                price=req.price,
+                strategy_name=req.reference,
+                order_remark=orderid
+            )
+        except Exception as ex:
+            self.gateway.write_log(f"委托请求发送异常：{ex}")
+            return ""
 
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
         self.gateway.on_order(order)
 
         vt_orderid: str = order.vt_orderid
+        self.gateway.write_log(
+            f"委托请求已发送：{stock_code} {req.direction.value} "
+            f"{int(req.volume)}@{req.price}，本地委托号{orderid}"
+        )
 
         return vt_orderid
 

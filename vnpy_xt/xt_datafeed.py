@@ -286,7 +286,7 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
         xt_symbol += "O"
 
     xtdata.download_history_data(xt_symbol, xt_interval, start, end)
-    data: dict = xtdata.get_local_data([], [xt_symbol], xt_interval, start, end, -1, "front_ratio", False)      # 默认等比前复权
+    data: dict = xtdata.get_local_data([], [xt_symbol], xt_interval, start, end, -1, "none", False)      # 使用不复权价格
 
     df: DataFrame = data[xt_symbol]
     return df
