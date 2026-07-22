@@ -1,6 +1,6 @@
 from datetime import datetime
 from collections.abc import Callable
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any
 
 from xtquant import (
@@ -114,6 +114,7 @@ ORDERTYPE_XT2VT: dict[int, OrderType] = {
 
 # 其他常量
 CHINA_TZ = ZoneInfo("Asia/Shanghai")       # 中国时区
+MIN_SUBSCRIPTION_COUNT: int = 50            # 用户可配置的订阅上限不得低于该值
 
 
 # 全局缓存字典
@@ -137,7 +138,8 @@ class XtGateway(BaseGateway):
         "仿真交易": ["是", "否"],
         "账号类型": ["股票", "股票期权"],
         "QMT路径": "",
-        "资金账号": ""
+        "资金账号": "",
+        "最大订阅数量": MIN_SUBSCRIPTION_COUNT
     }
 
     exchanges: list[str] = list(EXCHANGE_VT2XT.keys())
@@ -172,7 +174,31 @@ class XtGateway(BaseGateway):
         futures_active: bool = setting["期货市场"] == "是"
         option_active: bool = setting["期权市场"] == "是"
 
-        self.md_api.connect(token, stock_active, futures_active, option_active, client_mode)
+        try:
+            max_subscription_count: int = int(
+                setting.get("最大订阅数量", MIN_SUBSCRIPTION_COUNT)
+            )
+        except (TypeError, ValueError):
+            max_subscription_count = MIN_SUBSCRIPTION_COUNT
+            self.write_log(
+                f"最大订阅数量格式无效，使用默认值{MIN_SUBSCRIPTION_COUNT}"
+            )
+
+        if max_subscription_count < MIN_SUBSCRIPTION_COUNT:
+            self.write_log(
+                f"最大订阅数量不能小于{MIN_SUBSCRIPTION_COUNT}，"
+                f"已调整为{MIN_SUBSCRIPTION_COUNT}"
+            )
+            max_subscription_count = MIN_SUBSCRIPTION_COUNT
+
+        self.md_api.connect(
+            token,
+            stock_active,
+            futures_active,
+            option_active,
+            client_mode,
+            max_subscription_count
+        )
 
         self.trading = setting["仿真交易"] == "是"
         if self.trading:
@@ -192,6 +218,10 @@ class XtGateway(BaseGateway):
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         self.md_api.subscribe(req)
+
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """退订行情"""
+        self.md_api.unsubscribe(req)
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
@@ -231,6 +261,8 @@ class XtGateway(BaseGateway):
 
     def close(self) -> None:
         """关闭接口"""
+        self.md_api.close()
+
         if self.trading:
             self.td_api.close()
 
@@ -263,7 +295,26 @@ class XtMdApi:
         self.gateway_name: str = gateway.gateway_name
 
         self.inited: bool = False
-        self.subscribed: set = set()
+
+        # 已成功向XT行情接口订阅的标的集合，元素为XT格式代码（例如600000.SH）。
+        # 该集合用于快速判断标的是否已订阅，并兼容原有代码对subscribed的访问。
+        self.subscribed: set[str] = set()
+
+        # XT格式代码到订阅号的映射。subscribe_quote返回订阅号，
+        # unsubscribe_quote必须使用该订阅号，不能直接使用合约代码退订。
+        self.subscription_ids: dict[str, int] = {}
+
+        # 每个标的当前的逻辑订阅者集合。
+        # key为XT格式代码，value中的(app_name, subscriber_name)用于区分不同App和策略实例。
+        # 多个订阅者共享一个底层XT订阅，只有集合变空时才真正调用XT退订。
+        self.subscribers: dict[str, set[tuple[str, str]]] = {}
+
+        # 保护上述订阅状态，避免不同App并发订阅同一标的时重复创建底层订阅号。
+        self.subscription_lock: Lock = Lock()
+
+        # 当前Gateway允许同时存在的最大底层单标的订阅数。
+        # 默认和最小值均为50，连接时可由用户配置为更大的整数。
+        self.max_subscription_count: int = MIN_SUBSCRIPTION_COUNT
         self.last_volume: dict[str, float] = {}
 
         self.token: str = ""
@@ -358,7 +409,8 @@ class XtMdApi:
         stock_active: bool,
         futures_active: bool,
         option_active: bool,
-        client_mode: bool = False
+        client_mode: bool = False,
+        max_subscription_count: int = MIN_SUBSCRIPTION_COUNT
     ) -> None:
         """连接"""
         if client_mode:
@@ -371,6 +423,7 @@ class XtMdApi:
         self.stock_active = stock_active
         self.futures_active = futures_active
         self.option_active = option_active
+        self.max_subscription_count = max_subscription_count
 
         if self.inited:
             self.gateway.write_log("行情接口已经初始化，请勿重复操作")
@@ -389,6 +442,9 @@ class XtMdApi:
         self.inited = True
 
         self.gateway.write_log("行情接口连接成功")
+        self.gateway.write_log(
+            f"行情最大订阅数量：{self.max_subscription_count}"
+        )
 
         self.query_contracts()
 
@@ -587,23 +643,116 @@ class XtMdApi:
                 self.gateway.on_contract(contract)
 
     def subscribe(self, req: SubscribeRequest) -> None:
-        """订阅行情"""
+        """按订阅者汇总需求，并在必要时创建XT底层行情订阅。"""
+        # 只有已经查询到合约信息的标的才能订阅。
         if req.vt_symbol not in symbol_contract_map:
             return
 
+        # 将VeighNa合约代码转换为XT格式代码，ETF期权需要使用SHO/SZO后缀。
         xt_exchange: str = EXCHANGE_VT2XT[req.exchange]
         if xt_exchange in {"SH", "SZ"} and len(req.symbol) > 6:
             xt_exchange += "O"
 
         xt_symbol: str = req.symbol + "." + xt_exchange
+        subscriber: tuple[str, str] = (req.app_name, req.subscriber_name)
 
-        if xt_symbol not in self.subscribed:
-            xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
+        with self.subscription_lock:
+            # 底层订阅已存在时，只登记新的逻辑订阅者，不重复调用subscribe_quote。
+            if xt_symbol in self.subscription_ids:
+                self.subscribers.setdefault(xt_symbol, set()).add(subscriber)
+                self.gateway.write_log(
+                    f"行情订阅完成，当前订阅标的数量：{len(self.subscription_ids)}"
+                )
+                return
+
+            # 限制的是XT底层单标的订阅数量，而不是共享该标的的策略数量。
+            # 已订阅标的达到上限后拒绝新标的，不保存订阅者，调用方之后可以重试。
+            if len(self.subscription_ids) >= self.max_subscription_count:
+                self.gateway.write_log(
+                    f"行情订阅失败，已达到最大订阅数量"
+                    f"{self.max_subscription_count}：{xt_symbol}"
+                )
+                return
+
+            # 先登记逻辑订阅者，再向XT创建唯一的底层订阅。
+            subscribers: set[tuple[str, str]] = self.subscribers.setdefault(xt_symbol, set())
+            subscribers.add(subscriber)
+
+            subscription_id: int = xtdata.subscribe_quote(
+                stock_code=xt_symbol,
+                period="tick",
+                callback=self.onMarketData
+            )
+
+            # XT返回值大于0才表示订阅成功。失败时回滚订阅者记录，避免留下脏状态。
+            if subscription_id <= 0:
+                subscribers.remove(subscriber)
+                if not subscribers:
+                    self.subscribers.pop(xt_symbol)
+
+                self.gateway.write_log(f"行情订阅失败：{xt_symbol}")
+                return
+
+            self.subscription_ids[xt_symbol] = subscription_id
             self.subscribed.add(xt_symbol)
+            self.gateway.write_log(
+                f"行情订阅完成，当前订阅标的数量：{len(self.subscription_ids)}"
+            )
+
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """移除逻辑订阅者，并在最后一个订阅者退出时退订XT行情。"""
+        # 使用与subscribe完全相同的规则生成XT格式代码。
+        xt_exchange: str = EXCHANGE_VT2XT[req.exchange]
+        if xt_exchange in {"SH", "SZ"} and len(req.symbol) > 6:
+            xt_exchange += "O"
+
+        xt_symbol: str = req.symbol + "." + xt_exchange
+        subscriber: tuple[str, str] = (req.app_name, req.subscriber_name)
+
+        with self.subscription_lock:
+            # 没有该标的的订阅记录时无需处理。
+            subscribers: set[tuple[str, str]] | None = self.subscribers.get(xt_symbol)
+            if subscribers is None:
+                return
+
+            # 调用者并未订阅该标的时不能影响其他订阅者。
+            if subscriber not in subscribers:
+                return
+
+            # 只移除当前App/策略实例的需求；仍有其他订阅者时保留底层XT订阅。
+            subscribers.remove(subscriber)
+            if subscribers:
+                self.gateway.write_log(
+                    f"行情退订完成，当前订阅标的数量：{len(self.subscription_ids)}"
+                )
+                return
+
+            # 最后一个订阅者已经退出，清理逻辑状态并使用保存的订阅号退订XT行情。
+            self.subscribers.pop(xt_symbol)
+            subscription_id: int | None = self.subscription_ids.pop(xt_symbol, None)
+            if subscription_id is None:
+                self.gateway.write_log(
+                    f"行情退订完成，当前订阅标的数量：{len(self.subscription_ids)}"
+                )
+                return
+
+            xtdata.unsubscribe_quote(subscription_id)
+            self.subscribed.discard(xt_symbol)
+            self.last_volume.pop(req.vt_symbol, None)
+            self.gateway.write_log(
+                f"行情退订完成，当前订阅标的数量：{len(self.subscription_ids)}"
+            )
 
     def close(self) -> None:
         """关闭连接"""
-        pass
+        with self.subscription_lock:
+            for subscription_id in self.subscription_ids.values():
+                xtdata.unsubscribe_quote(subscription_id)
+
+            self.subscribed.clear()
+            self.subscription_ids.clear()
+            self.subscribers.clear()
+            self.last_volume.clear()
 
 
 class XtTdApi(XtQuantTraderCallback):
