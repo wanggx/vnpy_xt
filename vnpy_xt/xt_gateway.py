@@ -486,7 +486,7 @@ class XtMdApi:
         xt_symbols: list[str] = []
         for name in markets:
             xt_symbols.extend(xtdata.get_stock_list_in_sector(name) or [])
-        return xt_symbols
+        return list(dict.fromkeys(xt_symbols))
 
     def _log_detail_progress(self, label: str, index: int, total: int) -> None:
         if index % CONTRACT_DETAIL_LOG_STEP == 0:
