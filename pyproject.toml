@@ -1,7 +1,7 @@
 [project]
 name = "vnpy_xt"
 dynamic = ["version"]
-description = "RQData datafeed for VeighNa quant trading framework."
+description = "Big QMT gateway and datafeed for VeighNa (xtquant-big-convert RPC)."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Xiaoyou Chen", email = "xiaoyou.chen@mail.vnpy.com"}]
@@ -22,8 +22,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "xtquant>=250516.1.1",
-    "filelock>=3.8.2"
+    "xtquant-big-convert[redis]",
 ]
 keywords = ["quant", "quantitative", "investment", "trading", "algotrading"]
 
@@ -79,5 +78,5 @@ warn_no_return = true
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["xtquant.*"]
+module = ["xtquant.*", "bigqmt_signal_trader.*", "pandas.*"]
 ignore_missing_imports = true

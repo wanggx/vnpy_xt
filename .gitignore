@@ -128,3 +128,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 .vscode/settings.json
+
+# 大 QMT 客户端私有配置（含账号）
+bigqmt_signal_trader_client_config.py

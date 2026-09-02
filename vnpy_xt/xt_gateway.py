@@ -3,12 +3,7 @@ from collections.abc import Callable
 from threading import Lock, Thread
 from typing import Any
 
-from xtquant import (
-    xtdata,
-    xtdatacenter as xtdc
-)
 from xtquant import xtconstant
-from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
 from xtquant.xttype import (
     StockAccount,
     XtAsset,
@@ -20,7 +15,12 @@ from xtquant.xttype import (
     XtOrderError,
     XtCancelError
 )
-from filelock import FileLock, Timeout
+from bigqmt_signal_trader.xtquant_compat import (
+    BigQmtXtTrader,
+    XtQuantTraderCallback,
+    configure,
+    xtdata,
+)
 
 from vnpy.event import EventEngine, EVENT_TIMER, Event
 from vnpy.trader.gateway import BaseGateway
@@ -47,11 +47,8 @@ from vnpy.trader.constant import (
 )
 from vnpy.trader.utility import (
     ZoneInfo,
-    get_file_path,
     round_to
 )
-
-from .xt_config import VIP_ADDRESS_LIST, LISTEN_PORT
 
 
 # 交易所映射
@@ -108,13 +105,18 @@ ORDERTYPE_VT2XT: dict[tuple, int] = {
     (Exchange.SZSE, OrderType.LIMIT): xtconstant.FIX_PRICE,
     (Exchange.BSE, OrderType.LIMIT): xtconstant.FIX_PRICE,
 }
+# MiniQMT 限价回报实测为 50；大 QMT / xtquant_compat 透传 passorder 的
+# FIX_PRICE=11。缺省或无法识别时 on_stock_order 再按限价兜底，避免回报被丢。
 ORDERTYPE_XT2VT: dict[int, OrderType] = {
     50: OrderType.LIMIT,
+    xtconstant.FIX_PRICE: OrderType.LIMIT,
 }
 
 # 其他常量
 CHINA_TZ = ZoneInfo("Asia/Shanghai")       # 中国时区
 MIN_SUBSCRIPTION_COUNT: int = 50            # 用户可配置的订阅上限不得低于该值
+DEFAULT_SUBSCRIPTION_COUNT: int = 500       # 连接界面默认最大订阅数量
+CONTRACT_DETAIL_LOG_STEP: int = 500         # 合约详情进度日志间隔
 
 
 # 全局缓存字典
@@ -124,22 +126,20 @@ symbol_limit_map: dict[str, tuple[float, float]] = {}   # 涨跌停价
 
 class XtGateway(BaseGateway):
     """
-    VeighNa用于对接迅投研的实时行情接口。
+    VeighNa 对接大 QMT（国金 ThinkTrader）的行情与交易接口。
+    行情与交易均走 xtquant-big-convert RPC，不连接 MiniQMT / xtdatacenter。
     """
 
     default_name: str = "XT"
 
     default_setting: dict[str, Any] = {
-        "行情连接": ["客户端", "Token"],
-        "token": "",
         "股票市场": ["是", "否"],
         "期货市场": ["是", "否"],
         "期权市场": ["是", "否"],
         "仿真交易": ["是", "否"],
-        "账号类型": ["股票", "股票期权"],
-        "QMT路径": "",
+        "账号类型": ["股票", "股票期权", "信用"],
         "资金账号": "",
-        "最大订阅数量": MIN_SUBSCRIPTION_COUNT
+        "最大订阅数量": DEFAULT_SUBSCRIPTION_COUNT
     }
 
     exchanges: list[str] = list(EXCHANGE_VT2XT.keys())
@@ -167,21 +167,18 @@ class XtGateway(BaseGateway):
 
     def _connect(self, setting: dict) -> None:
         """连接交易接口"""
-        token: str = setting["token"]
-        client_mode: bool = setting.get("行情连接", "Token") == "客户端" or not token
-
         stock_active: bool = setting["股票市场"] == "是"
         futures_active: bool = setting["期货市场"] == "是"
         option_active: bool = setting["期权市场"] == "是"
 
         try:
             max_subscription_count: int = int(
-                setting.get("最大订阅数量", MIN_SUBSCRIPTION_COUNT)
+                setting.get("最大订阅数量", DEFAULT_SUBSCRIPTION_COUNT)
             )
         except (TypeError, ValueError):
-            max_subscription_count = MIN_SUBSCRIPTION_COUNT
+            max_subscription_count = DEFAULT_SUBSCRIPTION_COUNT
             self.write_log(
-                f"最大订阅数量格式无效，使用默认值{MIN_SUBSCRIPTION_COUNT}"
+                f"最大订阅数量格式无效，使用默认值{DEFAULT_SUBSCRIPTION_COUNT}"
             )
 
         if max_subscription_count < MIN_SUBSCRIPTION_COUNT:
@@ -191,28 +188,39 @@ class XtGateway(BaseGateway):
             )
             max_subscription_count = MIN_SUBSCRIPTION_COUNT
 
+        accountid: str = str(setting.get("资金账号") or "").strip()
+        if accountid:
+            configure(account_id=accountid)
+        else:
+            self.write_log(
+                "未填写资金账号：大 QMT 行情 RPC 无法初始化。"
+                "请填写与 QMT 端 BIGQMT_ACCOUNT_ID 相同的资金账号。"
+            )
+
         self.md_api.connect(
-            token,
             stock_active,
             futures_active,
             option_active,
-            client_mode,
             max_subscription_count
         )
 
         self.trading = setting["仿真交易"] == "是"
         if self.trading:
-            path: str = setting["QMT路径"]
-            self.write_log(f"QMT路径: {path}")
-
-            accountid: str = setting["资金账号"]
+            if not accountid:
+                self.write_log("交易未启动：资金账号为空")
+                return
 
             if setting["账号类型"] == "股票":
                 account_type: str = "STOCK"
+            elif setting["账号类型"] == "信用":
+                account_type = "CREDIT"
             else:
                 account_type = "STOCK_OPTION"
 
-            self.td_api.connect(path, accountid, account_type)
+            self.write_log(
+                "交易走大 QMT RPC（资金账号须与 QMT 端 BIGQMT_ACCOUNT_ID 一致）"
+            )
+            self.td_api.connect(accountid, account_type)
             self.init_query()
 
     def subscribe(self, req: SubscribeRequest) -> None:
@@ -284,10 +292,7 @@ class XtGateway(BaseGateway):
 
 
 class XtMdApi:
-    """行情API"""
-
-    lock_filename = "xt_lock"
-    lock_filepath = get_file_path(lock_filename)
+    """行情API（大 QMT RPC，不经 MiniQMT / xtdatacenter）"""
 
     def __init__(self, gateway: XtGateway) -> None:
         """构造函数"""
@@ -317,109 +322,117 @@ class XtMdApi:
         self.max_subscription_count: int = MIN_SUBSCRIPTION_COUNT
         self.last_volume: dict[str, float] = {}
 
-        self.token: str = ""
-        self.client_mode: bool = False
         self.stock_active: bool = False
         self.futures_active: bool = False
         self.option_active: bool = False
 
-        xtdata.enable_hello = False
-
     def onMarketData(self, data: dict) -> None:
         """行情推送回调"""
+        if not data:
+            return
+
         for xt_symbol, buf in data.items():
-            for d in buf:
-                symbol, xt_exchange = xt_symbol.split(".")
-                exchange = EXCHANGE_XT2VT[xt_exchange]
+            for d in _as_tick_list(buf):
+                self._push_tick(xt_symbol, d)
 
-                tick: TickData = TickData(
-                    symbol=symbol,
-                    exchange=exchange,
-                    datetime=generate_datetime(d["time"]),
-                    volume=d["volume"],
-                    turnover=d["amount"],
-                    open_interest=d["openInt"],
-                    gateway_name=self.gateway_name
-                )
+    def _push_tick(self, xt_symbol: str, d: dict) -> None:
+        """将单笔 tick 转成 TickData 推送。"""
+        if "." not in str(xt_symbol):
+            return
 
-                contract = symbol_contract_map[tick.vt_symbol]
-                tick.name = contract.name
+        symbol, xt_exchange = xt_symbol.split(".", 1)
+        exchange = EXCHANGE_XT2VT.get(xt_exchange)
+        if exchange is None:
+            return
 
-                previous_volume: float | None = self.last_volume.get(tick.vt_symbol)
-                self.last_volume[tick.vt_symbol] = tick.volume
-                if previous_volume is not None:
-                    tick.last_volume = max(tick.volume - previous_volume, 0)
+        tick_time = d.get("time") or d.get("timetag") or 0
+        try:
+            tick_time = int(tick_time)
+        except (TypeError, ValueError):
+            tick_time = 0
 
-                bp_data: list = d["bidPrice"]
-                ap_data: list = d["askPrice"]
-                bv_data: list = d["bidVol"]
-                av_data: list = d["askVol"]
+        tick: TickData = TickData(
+            symbol=symbol,
+            exchange=exchange,
+            datetime=generate_datetime(tick_time) if tick_time else datetime.now(CHINA_TZ),
+            volume=d.get("volume") or 0,
+            turnover=d.get("amount") or 0,
+            open_interest=d.get("openInt") or d.get("openInterest") or 0,
+            gateway_name=self.gateway_name
+        )
 
-                tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
-                tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
-                tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
-                tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
-                tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
+        contract = symbol_contract_map.get(tick.vt_symbol)
+        if not contract:
+            return
+        tick.name = contract.name
 
-                tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
-                tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
-                tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
-                tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
-                tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
+        previous_volume: float | None = self.last_volume.get(tick.vt_symbol)
+        self.last_volume[tick.vt_symbol] = tick.volume
+        if previous_volume is not None:
+            tick.last_volume = max(tick.volume - previous_volume, 0)
 
-                tick.bid_volume_1 = bv_data[0]
-                tick.bid_volume_2 = bv_data[1]
-                tick.bid_volume_3 = bv_data[2]
-                tick.bid_volume_4 = bv_data[3]
-                tick.bid_volume_5 = bv_data[4]
+        bp_data: list = _pad_level(d.get("bidPrice") or d.get("bidPriceList"))
+        ap_data: list = _pad_level(d.get("askPrice") or d.get("askPriceList"))
+        bv_data: list = _pad_level(d.get("bidVol") or d.get("bidVolume") or d.get("bidVolList"))
+        av_data: list = _pad_level(d.get("askVol") or d.get("askVolume") or d.get("askVolList"))
 
-                tick.ask_volume_1 = av_data[0]
-                tick.ask_volume_2 = av_data[1]
-                tick.ask_volume_3 = av_data[2]
-                tick.ask_volume_4 = av_data[3]
-                tick.ask_volume_5 = av_data[4]
+        tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
+        tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
+        tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
+        tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
+        tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
 
-                tick.last_price = round_to(d["lastPrice"], contract.pricetick)
-                tick.open_price = round_to(d["open"], contract.pricetick)
-                tick.high_price = round_to(d["high"], contract.pricetick)
-                tick.low_price = round_to(d["low"], contract.pricetick)
-                tick.pre_close = round_to(d["lastClose"], contract.pricetick)
+        tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
+        tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
+        tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
+        tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
+        tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
 
-                if tick.vt_symbol in symbol_limit_map:
-                    tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
+        tick.bid_volume_1 = bv_data[0]
+        tick.bid_volume_2 = bv_data[1]
+        tick.bid_volume_3 = bv_data[2]
+        tick.bid_volume_4 = bv_data[3]
+        tick.bid_volume_5 = bv_data[4]
 
-                # 判断收盘状态
-                tick.extra = {
-                    "raw": d,
-                    "market_closed": False,
-                }
+        tick.ask_volume_1 = av_data[0]
+        tick.ask_volume_2 = av_data[1]
+        tick.ask_volume_3 = av_data[2]
+        tick.ask_volume_4 = av_data[3]
+        tick.ask_volume_5 = av_data[4]
 
-                # 非衍生品可以通过openInt字段判断证券状态
-                if contract.product not in {Product.FUTURES, Product.OPTION}:
-                    tick.extra["market_closed"] = d["openInt"] == 15
-                # 衍生品该字段为持仓量，需要通过结算价判断
-                elif d["settlementPrice"] > 0:
-                    tick.extra["market_closed"] = True
+        last_price = d.get("lastPrice") or d.get("last") or 0
+        tick.last_price = round_to(last_price, contract.pricetick)
+        tick.open_price = round_to(d.get("open") or 0, contract.pricetick)
+        tick.high_price = round_to(d.get("high") or 0, contract.pricetick)
+        tick.low_price = round_to(d.get("low") or 0, contract.pricetick)
+        tick.pre_close = round_to(d.get("lastClose") or d.get("preClose") or 0, contract.pricetick)
 
-                self.gateway.on_tick(tick)
+        if tick.vt_symbol in symbol_limit_map:
+            tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
+
+        settlement = d.get("settlementPrice") or d.get("settlement") or 0
+        tick.extra = {
+            "raw": d,
+            "market_closed": False,
+        }
+
+        if contract.product not in {Product.FUTURES, Product.OPTION}:
+            tick.extra["market_closed"] = d.get("openInt") == 15
+        elif settlement > 0:
+            tick.extra["market_closed"] = True
+
+        self.gateway.on_tick(tick)
 
     def connect(
         self,
-        token: str,
         stock_active: bool,
         futures_active: bool,
         option_active: bool,
-        client_mode: bool = False,
         max_subscription_count: int = MIN_SUBSCRIPTION_COUNT
     ) -> None:
-        """连接"""
-        if client_mode:
-            self.gateway.write_log("开始连接本地QMT行情服务，请稍等")
-        else:
-            self.gateway.write_log("开始启动行情服务，请稍等")
+        """连接大 QMT 行情 RPC（不启动 xtdatacenter）"""
+        self.gateway.write_log("开始连接大 QMT 行情 RPC，请稍等")
 
-        self.token = token
-        self.client_mode = client_mode
         self.stock_active = stock_active
         self.futures_active = futures_active
         self.option_active = option_active
@@ -430,13 +443,9 @@ class XtMdApi:
             return
 
         try:
-            if not self.client_mode:
-                self.init_xtdc()
-
-            # 尝试查询合约信息，确认连接成功
             xtdata.get_instrument_detail("000001.SZ")
         except Exception as ex:
-            self.gateway.write_log(f"迅投研数据服务初始化失败，发生异常：{ex}")
+            self.gateway.write_log(f"大 QMT 行情初始化失败，发生异常：{ex}")
             return
 
         self.inited = True
@@ -448,38 +457,17 @@ class XtMdApi:
 
         self.query_contracts()
 
-    def get_lock(self) -> bool:
-        """获取文件锁，确保单例运行"""
-        self.lock = FileLock(self.lock_filepath)
-
-        try:
-            self.lock.acquire(timeout=1)
-            return True
-        except Timeout:
-            return False
-
-    def init_xtdc(self) -> None:
-        """初始化xtdc服务进程"""
-        if not self.get_lock():
-            return
-
-        # 设置token
-        xtdc.set_token(self.token)
-
-        # 设置连接池
-        xtdc.set_allow_optmize_address(VIP_ADDRESS_LIST)
-
-        # 开启使用期货真实夜盘时间
-        xtdc.set_future_realtime_mode(True)
-
-        # 执行初始化，但不启动默认58609端口监听
-        xtdc.init(False)
-
-        # 设置监听端口
-        xtdc.listen(port=LISTEN_PORT)
-
     def query_contracts(self) -> None:
         """查询合约信息"""
+        started: datetime = datetime.now()
+        self.gateway.write_log(
+            "开始查询合约信息："
+            f"股票={'是' if self.stock_active else '否'} "
+            f"期货={'是' if self.futures_active else '否'} "
+            f"期权={'是' if self.option_active else '否'} "
+            "（RPC 逐只拉详情，股票全市场可能需要一两分钟）"
+        )
+
         if self.stock_active:
             self.query_stock_contracts()
 
@@ -489,131 +477,138 @@ class XtMdApi:
         if self.option_active:
             self.query_option_contracts()
 
-        self.gateway.write_log("合约信息查询成功")
+        elapsed: float = (datetime.now() - started).total_seconds()
+        self.gateway.write_log(
+            f"合约信息查询成功，合计 {len(symbol_contract_map)} 只，耗时 {elapsed:.1f} 秒"
+        )
+
+    def _collect_sector_codes(self, markets: list) -> list[str]:
+        xt_symbols: list[str] = []
+        for name in markets:
+            xt_symbols.extend(xtdata.get_stock_list_in_sector(name) or [])
+        return xt_symbols
+
+    def _log_detail_progress(self, label: str, index: int, total: int) -> None:
+        if index % CONTRACT_DETAIL_LOG_STEP == 0:
+            self.gateway.write_log(f"{label}合约详情进度 {index}/{total}")
 
     def query_stock_contracts(self) -> None:
         """查询股票合约信息"""
-        xt_symbols: list[str] = []
-        markets: list = [
+        xt_symbols: list[str] = self._collect_sector_codes([
             "沪深A股",
-            "沪深转债",
             "沪深ETF",
             "沪深指数",
             "京市A股"
-        ]
+        ])
+        total: int = len(xt_symbols)
 
-        for i in markets:
-            names: list = xtdata.get_stock_list_in_sector(i)
-            xt_symbols.extend(names)
+        for index, xt_symbol in enumerate(xt_symbols, start=1):
+            try:
+                # 筛选需要的合约
+                product = None
+                symbol, xt_exchange = xt_symbol.split(".")
 
-        for xt_symbol in xt_symbols:
-            # 筛选需要的合约
-            product = None
-            symbol, xt_exchange = xt_symbol.split(".")
-
-            if xt_exchange == "SZ":
-                if xt_symbol.startswith("00"):
+                if xt_exchange == "SZ":
+                    if xt_symbol.startswith("00"):
+                        product = Product.EQUITY
+                    elif xt_symbol.startswith("159"):
+                        product = Product.FUND
+                    else:
+                        product = Product.INDEX
+                elif xt_exchange == "SH":
+                    if xt_symbol.startswith(("60", "68")):
+                        product = Product.EQUITY
+                    elif xt_symbol.startswith("51"):
+                        product = Product.FUND
+                    else:
+                        product = Product.INDEX
+                elif xt_exchange == "BJ":
                     product = Product.EQUITY
-                elif xt_symbol.startswith("159"):
-                    product = Product.FUND
-                else:
-                    product = Product.INDEX
-            elif xt_exchange == "SH":
-                if xt_symbol.startswith(("60", "68")):
-                    product = Product.EQUITY
-                elif xt_symbol.startswith("51"):
-                    product = Product.FUND
-                else:
-                    product = Product.INDEX
-            elif xt_exchange == "BJ":
-                product = Product.EQUITY
 
-            if not product:
-                continue
+                if not product:
+                    continue
 
-            # 生成并推送合约信息
-            data: dict = xtdata.get_instrument_detail(xt_symbol)
-            if data is None:
-                self.gateway.write_log(f"合约{xt_symbol}信息查询失败")
-                continue
+                # 生成并推送合约信息
+                data: dict = xtdata.get_instrument_detail(xt_symbol)
+                if data is None:
+                    continue
 
-            contract: ContractData = ContractData(
-                symbol=symbol,
-                exchange=EXCHANGE_XT2VT[xt_exchange],
-                name=data["InstrumentName"],
-                product=product,
-                size=data["VolumeMultiple"],
-                pricetick=data["PriceTick"],
-                history_data=False,
-                gateway_name=self.gateway_name
-            )
+                contract: ContractData = ContractData(
+                    symbol=symbol,
+                    exchange=EXCHANGE_XT2VT[xt_exchange],
+                    name=data["InstrumentName"],
+                    product=product,
+                    size=data["VolumeMultiple"],
+                    pricetick=data["PriceTick"],
+                    history_data=False,
+                    gateway_name=self.gateway_name
+                )
 
-            symbol_contract_map[contract.vt_symbol] = contract
-            symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
+                symbol_contract_map[contract.vt_symbol] = contract
+                symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
 
-            self.gateway.on_contract(contract)
+                self.gateway.on_contract(contract)
+            finally:
+                self._log_detail_progress("股票", index, total)
 
     def query_future_contracts(self) -> None:
         """查询期货合约信息"""
-        xt_symbols: list[str] = []
-        markets: list = [
+        xt_symbols: list[str] = self._collect_sector_codes([
             "中金所期货",
             "上期所期货",
             "能源中心期货",
             "大商所期货",
             "郑商所期货",
             "广期所期货"
-        ]
+        ])
+        total: int = len(xt_symbols)
 
-        for i in markets:
-            names: list = xtdata.get_stock_list_in_sector(i)
-            xt_symbols.extend(names)
+        for index, xt_symbol in enumerate(xt_symbols, start=1):
+            try:
+                # 筛选需要的合约
+                product = None
+                symbol, xt_exchange = xt_symbol.split(".")
 
-        for xt_symbol in xt_symbols:
-            # 筛选需要的合约
-            product = None
-            symbol, xt_exchange = xt_symbol.split(".")
+                if xt_exchange == "ZF" and len(symbol) > 6 and "&" not in symbol:
+                    product = Product.OPTION
+                elif xt_exchange in ("IF", "GF") and "-" in symbol:
+                    product = Product.OPTION
+                elif xt_exchange in ("DF", "INE", "SF") and ("C" in symbol or "P" in symbol) and "SP" not in symbol:
+                    product = Product.OPTION
+                else:
+                    product = Product.FUTURES
 
-            if xt_exchange == "ZF" and len(symbol) > 6 and "&" not in symbol:
-                product = Product.OPTION
-            elif xt_exchange in ("IF", "GF") and "-" in symbol:
-                product = Product.OPTION
-            elif xt_exchange in ("DF", "INE", "SF") and ("C" in symbol or "P" in symbol) and "SP" not in symbol:
-                product = Product.OPTION
-            else:
-                product = Product.FUTURES
+                # 生成并推送合约信息
+                if product == Product.OPTION:
+                    data: dict = xtdata.get_instrument_detail(xt_symbol, True)
+                else:
+                    data = xtdata.get_instrument_detail(xt_symbol)
 
-            # 生成并推送合约信息
-            if product == Product.OPTION:
-                data: dict = xtdata.get_instrument_detail(xt_symbol, True)
-            else:
-                data = xtdata.get_instrument_detail(xt_symbol)
+                if not data["ExpireDate"]:
+                    if "00" not in symbol:
+                        continue
 
-            if not data["ExpireDate"]:
-                if "00" not in symbol:
-                    continue
+                contract: ContractData = ContractData(
+                    symbol=symbol,
+                    exchange=EXCHANGE_XT2VT[xt_exchange],
+                    name=data["InstrumentName"],
+                    product=product,
+                    size=data["VolumeMultiple"],
+                    pricetick=data["PriceTick"],
+                    history_data=False,
+                    gateway_name=self.gateway_name
+                )
 
-            contract: ContractData = ContractData(
-                symbol=symbol,
-                exchange=EXCHANGE_XT2VT[xt_exchange],
-                name=data["InstrumentName"],
-                product=product,
-                size=data["VolumeMultiple"],
-                pricetick=data["PriceTick"],
-                history_data=False,
-                gateway_name=self.gateway_name
-            )
+                symbol_contract_map[contract.vt_symbol] = contract
+                symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
 
-            symbol_contract_map[contract.vt_symbol] = contract
-            symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
-
-            self.gateway.on_contract(contract)
+                self.gateway.on_contract(contract)
+            finally:
+                self._log_detail_progress("期货", index, total)
 
     def query_option_contracts(self) -> None:
         """查询期权合约信息"""
-        xt_symbols: list[str] = []
-
-        markets: list = [
+        xt_symbols: list[str] = self._collect_sector_codes([
             "上证期权",
             "深证期权",
             "中金所期权",
@@ -622,25 +617,23 @@ class XtMdApi:
             "大商所期权",
             "郑商所期权",
             "广期所期权"
-        ]
+        ])
+        total: int = len(xt_symbols)
 
-        for i in markets:
-            names: list = xtdata.get_stock_list_in_sector(i)
-            xt_symbols.extend(names)
+        for index, xt_symbol in enumerate(xt_symbols, start=1):
+            try:
+                _, xt_exchange = xt_symbol.split(".")
 
-        for xt_symbol in xt_symbols:
-            ""
-            _, xt_exchange = xt_symbol.split(".")
+                if xt_exchange in {"SHO", "SZO"}:
+                    contract = process_etf_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
+                else:
+                    contract = process_futures_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
 
-            if xt_exchange in {"SHO", "SZO"}:
-                contract = process_etf_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
-            else:
-                contract = process_futures_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
-
-            if contract:
-                symbol_contract_map[contract.vt_symbol] = contract
-
-                self.gateway.on_contract(contract)
+                if contract:
+                    symbol_contract_map[contract.vt_symbol] = contract
+                    self.gateway.on_contract(contract)
+            finally:
+                self._log_detail_progress("期权", index, total)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """按订阅者汇总需求，并在必要时创建XT底层行情订阅。"""
@@ -769,14 +762,13 @@ class XtTdApi(XtQuantTraderCallback):
         self.connected: bool = False
 
         self.account_id: str = ""
-        self.path: str = ""
         self.account_type: str = ""
 
         self.order_count: int = 0
 
         self.active_localid_sysid_map: dict[str, str] = {}
 
-        self.xt_client: XtQuantTrader = None
+        self.xt_client: BigQmtXtTrader = None
         self.xt_account: StockAccount = None
 
     def on_connected(self) -> None:
@@ -792,7 +784,7 @@ class XtTdApi(XtQuantTraderCallback):
 
         # 尝试重连，重连需要更换session_id
         session: int = int(float(datetime.now().strftime("%H%M%S.%f")) * 1000)
-        connect_result: int = self.connect(self.path, self.account_id, self.account_type, session)
+        connect_result: int = self.connect(self.account_id, self.account_type, session)
 
         if connect_result:
             self.gateway.write_log("交易接口重连失败")
@@ -835,8 +827,10 @@ class XtTdApi(XtQuantTraderCallback):
         if not xt_order.order_remark:
             return
 
-        # 过滤不支持的委托类型
+        # 过滤不支持的委托类型。大 QMT 回报常见 FIX_PRICE=11，或缺少 price_type。
         type: OrderType = ORDERTYPE_XT2VT.get(xt_order.price_type, None)
+        if type is None and xt_order.price_type in (None, ""):
+            type = OrderType.LIMIT
         if not type:
             return
 
@@ -963,18 +957,24 @@ class XtTdApi(XtQuantTraderCallback):
         else:
             self.gateway.write_log(f"撤单请求提交成功，系统委托号{response.order_sysid}")
 
-    def connect(self, path: str, accountid: str, account_type: str, session: int = 0) -> int:
+    def connect(
+        self,
+        accountid: str,
+        account_type: str,
+        session: int = 0
+    ) -> int:
         """发起连接"""
         self.inited = True
         self.account_id = accountid
-        self.path = path
         self.account_type = account_type
 
-        # 创建客户端和账号实例
         if not session:
             session = int(float(datetime.now().strftime("%H%M%S.%f")) * 1000)
 
-        self.xt_client = XtQuantTrader(self.path, session)
+        self.xt_client = BigQmtXtTrader(
+            session_id=session,
+            account_id=self.account_id,
+        )
 
         self.xt_account = StockAccount(self.account_id, account_type=self.account_type)
 
@@ -1097,22 +1097,32 @@ class XtTdApi(XtQuantTraderCallback):
     def query_position(self) -> None:
         """查询持仓"""
         if self.connected:
-            self.xt_client.query_stock_positions_async(self.xt_account, self.on_query_positions_async)
+            self.xt_client.query_stock_positions_async(
+                self.xt_account, callback=self.on_query_positions_async
+            )
 
     def query_account(self) -> None:
         """查询账户资金"""
         if self.connected:
-            self.xt_client.query_stock_asset_async(self.xt_account, self.on_query_asset_async)
+            self.xt_client.query_stock_asset_async(
+                self.xt_account, callback=self.on_query_asset_async
+            )
 
     def query_order(self) -> None:
         """查询委托信息"""
         if self.connected:
-            self.xt_client.query_stock_orders_async(self.xt_account, self.on_query_order_async)
+            # 必须用 callback=：大 QMT 兼容层第二参是 cancelable_only，
+            # 位置传回调会变成 True 且永远不触发 on_query_order_async。
+            self.xt_client.query_stock_orders_async(
+                self.xt_account, callback=self.on_query_order_async
+            )
 
     def query_trade(self) -> None:
         """查询成交信息"""
         if self.connected:
-            self.xt_client.query_stock_trades_async(self.xt_account, self.on_query_trades_async)
+            self.xt_client.query_stock_trades_async(
+                self.xt_account, callback=self.on_query_trades_async
+            )
 
     def close(self) -> None:
         """关闭连接"""
@@ -1120,14 +1130,61 @@ class XtTdApi(XtQuantTraderCallback):
             self.xt_client.stop()
 
 
-def generate_datetime(timestamp: int, millisecond: bool = True) -> datetime:
-    """生成本地时间"""
-    if millisecond:
-        dt: datetime = datetime.fromtimestamp(timestamp / 1000)
+def _as_tick_list(buf: Any) -> list[dict]:
+    """MiniQMT subscribe_quote 是 {code: [tick, ...]}；大 QMT 全推是 {code: tick_dict}。"""
+    if buf is None:
+        return []
+    if isinstance(buf, list):
+        return [item for item in buf if isinstance(item, dict)]
+    if isinstance(buf, dict):
+        return [buf]
+    return []
+
+
+def _pad_level(values: Any, size: int = 5) -> list[float]:
+    """五档不足时补 0，避免下标越界。"""
+    if not values:
+        return [0.0] * size
+    data = list(values)[:size]
+    while len(data) < size:
+        data.append(0.0)
+    return [float(item or 0) for item in data]
+
+
+def generate_datetime(timestamp: int | float | str | datetime, millisecond: bool = True) -> datetime:
+    """生成本地时间。识别 datetime、YYYYMMDD[HHMMSS]、秒 / 毫秒 Unix 时间戳。"""
+    if isinstance(timestamp, datetime):
+        dt: datetime = timestamp
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=CHINA_TZ)
+        return dt.astimezone(CHINA_TZ)
+
+    if isinstance(timestamp, str):
+        text: str = timestamp.strip()
+        for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y%m%d"):
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=CHINA_TZ)
+            except ValueError:
+                continue
+        try:
+            timestamp = int(float(text))
+        except (TypeError, ValueError):
+            return datetime.now(CHINA_TZ)
+
+    ts = int(timestamp or 0)
+    if ts <= 0:
+        return datetime.now(CHINA_TZ)
+    # 大 QMT K 线常见 YYYYMMDD / YYYYMMDDHHMMSS，须先于 Unix 毫秒判断
+    if 19_000_101 <= ts <= 20_991_231:
+        return datetime.strptime(str(ts), "%Y%m%d").replace(tzinfo=CHINA_TZ)
+    if 19_000_101_000_000 <= ts <= 20_991_231_235_959:
+        return datetime.strptime(str(ts), "%Y%m%d%H%M%S").replace(tzinfo=CHINA_TZ)
+    # 秒级约 10 位，毫秒级 13 位
+    if millisecond and ts > 10_000_000_000:
+        dt = datetime.fromtimestamp(ts / 1000)
     else:
-        dt = datetime.fromtimestamp(timestamp)
-    dt = dt.replace(tzinfo=CHINA_TZ)
-    return dt
+        dt = datetime.fromtimestamp(ts)
+    return dt.replace(tzinfo=CHINA_TZ)
 
 
 def process_etf_option(get_instrument_detail: Callable, xt_symbol: str, gateway_name: str) -> ContractData | None:

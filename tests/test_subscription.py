@@ -7,6 +7,7 @@ from vnpy.trader.constant import Exchange
 from vnpy.trader.object import SubscribeRequest
 
 from vnpy_xt.xt_gateway import (
+    DEFAULT_SUBSCRIPTION_COUNT,
     MIN_SUBSCRIPTION_COUNT,
     XtGateway,
     XtMdApi,
@@ -119,11 +120,9 @@ def test_gateway_subscription_limit_setting_has_minimum() -> None:
     gateway._connect(setting)
 
     gateway.md_api.connect.assert_called_once_with(
-        "",
         False,
         False,
         False,
-        True,
         MIN_SUBSCRIPTION_COUNT
     )
-    assert XtGateway.default_setting["最大订阅数量"] == MIN_SUBSCRIPTION_COUNT
+    assert XtGateway.default_setting["最大订阅数量"] == DEFAULT_SUBSCRIPTION_COUNT

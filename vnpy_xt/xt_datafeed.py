@@ -2,19 +2,13 @@ from datetime import datetime, timedelta, time
 from collections.abc import Callable
 
 from pandas import DataFrame
-from xtquant import (
-    xtdata,
-    xtdatacenter as xtdc
-)
-from filelock import FileLock, Timeout
+from bigqmt_signal_trader.xtquant_compat import xtdata
 
-from vnpy.trader.setting import SETTINGS
 from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.object import BarData, TickData, HistoryRequest
-from vnpy.trader.utility import ZoneInfo, get_file_path
 from vnpy.trader.datafeed import BaseDatafeed
 
-from .xt_config import VIP_ADDRESS_LIST, LISTEN_PORT
+from .xt_gateway import generate_datetime
 
 
 INTERVAL_VT2XT: dict[Interval, str] = {
@@ -40,24 +34,13 @@ EXCHANGE_VT2XT: dict[Exchange, str] = {
     Exchange.GFEX: "GF",
 }
 
-CHINA_TZ = ZoneInfo("Asia/Shanghai")
-
 
 class XtDatafeed(BaseDatafeed):
-    """迅投研数据服务接口"""
-
-    lock_filename = "xt_lock"
-    lock_filepath = get_file_path(lock_filename)
+    """大 QMT RPC 历史数据接口（不经 MiniQMT / 迅投研 xtdatacenter）"""
 
     def __init__(self) -> None:
         """"""
-        self.username: str = SETTINGS["datafeed.username"]
-        self.password: str = SETTINGS["datafeed.password"]
         self.inited: bool = False
-
-        self.lock: FileLock | None = None
-
-        xtdata.enable_hello = False
 
     def init(self, output: Callable = print) -> bool:
         """初始化"""
@@ -65,48 +48,13 @@ class XtDatafeed(BaseDatafeed):
             return True
 
         try:
-            # 使用Token连接，无需启动客户端
-            if self.username != "client":
-                self.init_xtdc()
-
-            # 尝试查询合约信息，确认连接成功
             xtdata.get_instrument_detail("000001.SZ")
         except Exception as ex:
-            output(f"迅投研数据服务初始化失败，发生异常：{ex}")
+            output(f"大 QMT 数据服务初始化失败，发生异常：{ex}")
             return False
 
         self.inited = True
         return True
-
-    def get_lock(self) -> bool:
-        """获取文件锁，确保单例运行"""
-        self.lock = FileLock(self.lock_filepath)
-
-        try:
-            self.lock.acquire(timeout=1)
-            return True
-        except Timeout:
-            return False
-
-    def init_xtdc(self) -> None:
-        """初始化xtdc服务进程"""
-        if not self.get_lock():
-            return
-
-        # 设置token
-        xtdc.set_token(self.password)
-
-        # 设置连接池
-        xtdc.set_allow_optmize_address(VIP_ADDRESS_LIST)
-
-        # 开启使用期货真实夜盘时间
-        xtdc.set_future_realtime_mode(True)
-
-        # 执行初始化，但不启动默认58609端口监听
-        xtdc.init(False)
-
-        # 设置监听端口
-        xtdc.listen(port=LISTEN_PORT)
 
     def query_bar_history(self, req: HistoryRequest, output: Callable = print) -> list[BarData] | None:
         """查询K线数据"""
@@ -124,12 +72,10 @@ class XtDatafeed(BaseDatafeed):
         adjustment: timedelta = INTERVAL_ADJUSTMENT_MAP[req.interval]
 
         # 遍历解析
-        auction_bar: BarData = None
+        auction_bar: BarData | None = None
 
         for tp in df.itertuples():
-            # 将迅投研时间戳（K线结束时点）转换为VeighNa时间戳（K线开始时点）
-            dt: datetime = datetime.fromtimestamp(tp.time / 1000)
-            dt = dt.replace(tzinfo=CHINA_TZ)
+            dt: datetime = generate_datetime(_row_time(tp), millisecond=True)
             dt = dt - adjustment
 
             # 日线，过滤尚未走完的当日数据
@@ -155,7 +101,7 @@ class XtDatafeed(BaseDatafeed):
                         datetime=dt,
                         open_price=float(tp.open),
                         volume=float(tp.volume),
-                        turnover=float(tp.amount),
+                        turnover=float(getattr(tp, "amount", 0) or 0),
                         gateway_name="XT"
                     )
                     continue
@@ -167,8 +113,8 @@ class XtDatafeed(BaseDatafeed):
                 datetime=dt,
                 interval=req.interval,
                 volume=float(tp.volume),
-                turnover=float(tp.amount),
-                open_interest=float(tp.openInterest),
+                turnover=float(getattr(tp, "amount", 0) or 0),
+                open_interest=float(getattr(tp, "openInterest", 0) or 0),
                 open_price=float(tp.open),
                 high_price=float(tp.high),
                 low_price=float(tp.low),
@@ -204,62 +150,81 @@ class XtDatafeed(BaseDatafeed):
 
         # 遍历解析
         for tp in df.itertuples():
-            dt: datetime = datetime.fromtimestamp(tp.time / 1000)
-            dt = dt.replace(tzinfo=CHINA_TZ)
+            dt: datetime = generate_datetime(_row_time(tp), millisecond=True)
 
-            bidPrice: list[float] = tp.bidPrice
-            askPrice: list[float] = tp.askPrice
-            bidVol: list[float] = tp.bidVol
-            askVol: list[float] = tp.askVol
+            bid_price: list[float] = _level_list(getattr(tp, "bidPrice", None))
+            ask_price: list[float] = _level_list(getattr(tp, "askPrice", None))
+            bid_vol: list[float] = _level_list(getattr(tp, "bidVol", None))
+            ask_vol: list[float] = _level_list(getattr(tp, "askVol", None))
 
             tick: TickData = TickData(
                 symbol=req.symbol,
                 exchange=req.exchange,
                 datetime=dt,
-                volume=float(tp.volume),
-                turnover=float(tp.amount),
-                open_interest=float(tp.openInt),
-                open_price=float(tp.open),
-                high_price=float(tp.high),
-                low_price=float(tp.low),
-                last_price=float(tp.lastPrice),
-                pre_close=float(tp.lastClose),
-                bid_price_1=float(bidPrice[0]),
-                ask_price_1=float(askPrice[0]),
-                bid_volume_1=float(bidVol[0]),
-                ask_volume_1=float(askVol[0]),
+                volume=float(getattr(tp, "volume", 0) or 0),
+                turnover=float(getattr(tp, "amount", 0) or 0),
+                open_interest=float(getattr(tp, "openInt", 0) or 0),
+                open_price=float(getattr(tp, "open", 0) or 0),
+                high_price=float(getattr(tp, "high", 0) or 0),
+                low_price=float(getattr(tp, "low", 0) or 0),
+                last_price=float(getattr(tp, "lastPrice", 0) or 0),
+                pre_close=float(getattr(tp, "lastClose", 0) or 0),
+                bid_price_1=float(bid_price[0]),
+                ask_price_1=float(ask_price[0]),
+                bid_volume_1=float(bid_vol[0]),
+                ask_volume_1=float(ask_vol[0]),
                 gateway_name="XT",
             )
 
-            bid_price_2: float = float(bidPrice[1])
+            bid_price_2: float = float(bid_price[1])
             if bid_price_2:
                 tick.bid_price_2 = bid_price_2
-                tick.bid_price_3 = float(bidPrice[2])
-                tick.bid_price_4 = float(bidPrice[3])
-                tick.bid_price_5 = float(bidPrice[4])
+                tick.bid_price_3 = float(bid_price[2])
+                tick.bid_price_4 = float(bid_price[3])
+                tick.bid_price_5 = float(bid_price[4])
 
-                tick.ask_price_2 = float(askPrice[1])
-                tick.ask_price_3 = float(askPrice[2])
-                tick.ask_price_4 = float(askPrice[3])
-                tick.ask_price_5 = float(askPrice[4])
+                tick.ask_price_2 = float(ask_price[1])
+                tick.ask_price_3 = float(ask_price[2])
+                tick.ask_price_4 = float(ask_price[3])
+                tick.ask_price_5 = float(ask_price[4])
 
-                tick.bid_volume_2 = float(bidVol[1])
-                tick.bid_volume_3 = float(bidVol[2])
-                tick.bid_volume_4 = float(bidVol[3])
-                tick.bid_volume_5 = float(bidVol[4])
+                tick.bid_volume_2 = float(bid_vol[1])
+                tick.bid_volume_3 = float(bid_vol[2])
+                tick.bid_volume_4 = float(bid_vol[3])
+                tick.bid_volume_5 = float(bid_vol[4])
 
-                tick.ask_volume_2 = float(askVol[1])
-                tick.ask_volume_3 = float(askVol[2])
-                tick.ask_volume_4 = float(askVol[3])
-                tick.ask_volume_5 = float(askVol[4])
+                tick.ask_volume_2 = float(ask_vol[1])
+                tick.ask_volume_3 = float(ask_vol[2])
+                tick.ask_volume_4 = float(ask_vol[3])
+                tick.ask_volume_5 = float(ask_vol[4])
 
             history.append(tick)
 
         return history
 
 
+def _row_time(tp: object) -> object:
+    for name in ("time", "stime"):
+        raw = getattr(tp, name, None)
+        if raw is not None:
+            return raw
+    raw = getattr(tp, "Index", None)
+    if isinstance(raw, datetime):
+        return raw
+    return 0
+
+
+def _level_list(values: object, size: int = 5) -> list[float]:
+    if values is None:
+        return [0.0] * size
+    data = list(values)[:size]
+    while len(data) < size:
+        data.append(0.0)
+    return [float(item or 0) for item in data]
+
+
 def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
-    """获取历史数据DataFrame"""
+    """从大 QMT RPC 取历史 DataFrame（读终端本地/实时库，不经迅投研）。"""
     symbol: str = req.symbol
     exchange: Exchange = req.exchange
     start_dt: datetime = req.start
@@ -271,13 +236,12 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
 
     xt_interval: str | None = INTERVAL_VT2XT.get(interval, None)
     if not xt_interval:
-        output(f"迅投研查询历史数据失败：不支持的时间周期{interval.value}")
+        output(f"大 QMT 查询历史数据失败：不支持的时间周期{interval.value}")
         return DataFrame()
 
     # 为了查询夜盘数据
     end_dt += timedelta(1)
 
-    # 从服务器下载获取
     xt_symbol: str = symbol + "." + EXCHANGE_VT2XT[exchange]
     start: str = start_dt.strftime("%Y%m%d%H%M%S")
     end: str = end_dt.strftime("%Y%m%d%H%M%S")
@@ -285,8 +249,35 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
     if exchange in (Exchange.SSE, Exchange.SZSE) and len(symbol) > 6:
         xt_symbol += "O"
 
-    xtdata.download_history_data(xt_symbol, xt_interval, start, end)
-    data: dict = xtdata.get_local_data([], [xt_symbol], xt_interval, start, end, -1, "none", False)      # 使用不复权价格
+    try:
+        data: dict = xtdata.get_market_data_ex(
+            field_list=[],
+            stock_list=[xt_symbol],
+            period=xt_interval,
+            start_time=start,
+            end_time=end,
+            count=-1,
+            dividend_type="none",
+            fill_data=False,
+        ) or {}
+    except Exception as ex:
+        output(f"大 QMT 查询历史数据失败：{ex}")
+        return DataFrame()
 
-    df: DataFrame = data[xt_symbol]
+    df = None
+    if isinstance(data, dict):
+        df = data.get(xt_symbol)
+        if df is None:
+            wanted: str = xt_symbol.upper()
+            for key, value in data.items():
+                if str(key).upper() == wanted:
+                    df = value
+                    break
+    if df is None or not isinstance(df, DataFrame) or df.empty:
+        output(
+            f"大 QMT 未返回 {xt_symbol} 的 {xt_interval} 数据。"
+            "请在交易端「数据管理」补充对应周期后再查。"
+        )
+        return DataFrame()
+
     return df

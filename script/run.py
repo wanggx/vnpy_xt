@@ -1,3 +1,12 @@
+import os
+import sys
+
+# python script/run.py 时 sys.path[0] 是 script/，找不到仓库根下的
+# 从 xtquant-big-convert 拷来的 bigqmt_signal_trader / xtquant。
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.ui import MainWindow, create_qapp
@@ -6,11 +15,8 @@ from vnpy_xt import XtGateway
 from vnpy_datamanager import DataManagerApp
 
 
-# 配置datafeed相关信息，也可以通过vt_setting.json全局文件配置
-# from vnpy.trader.setting import SETTINGS
-# SETTINGS["datafeed.name"] = "xt"
-# SETTINGS["datafeed.username"] = "token"
-# SETTINGS["datafeed.password"] = "xxx"
+# 历史数据走大 QMT RPC，不再配置迅投研 token。
+# 需 xtquant-big-convert 与 QMT 端 BIGQMT_REDIS_DRYRUN 已运行。
 
 
 def main():

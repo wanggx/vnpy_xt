@@ -1,4 +1,4 @@
-# VeighNa框架的迅投研数据服务接口
+# VeighNa 大 QMT（国金 ThinkTrader）行情与交易接口
 
 <p align="center">
   <img src ="https://vnpy.oss-cn-shanghai.aliyuncs.com/vnpy-logo.png"/>
@@ -13,7 +13,10 @@
 
 ## 说明
 
-基于迅投XtQuant封装开发的实时行情和数据服务接口，支持以下中国金融市场的K线和Tick数据：
+基于 [xtquant-big-convert](https://github.com/litaolemo/xtquant_big_convert) 对接大 QMT 终端的实时行情、交易与历史数据。
+行情与交易均走 Redis/ZMQ RPC，**不使用 MiniQMT、迅投研 Token，也不启动 xtdatacenter**。
+
+支持以下中国金融市场的 K 线和 Tick 数据：
 
 * 股票、基金、债券、ETF期权：
   * SSE：上海证券交易所
@@ -46,22 +49,9 @@ pip install .
 
 ## 使用
 
-迅投数据试用账号申请链接：[VeighNa社区专属14天试用权限](https://xuntou.net/#/signup?utm_source=vnpy)
+本分支只对接大 QMT。请勿安装官方 `xtquant` MiniQMT 客户端包，否则会与 `xtquant-big-convert` 的同名 shim 冲突。
 
-**Token连接**
-
-1. 连接前请先确保xtquant模块可以正常加载（在[投研知识库](http://docs.thinktrader.net/)下载xtquant的安装包，解压后放置xtquant包到自己使用的Python环境的site_packages文件夹下）。
-2. 登录[迅投研服务平台](https://xuntou.net/#/userInfo)，在【用户中心】-【个人设置】-【接口TOKEN】处获取Token。
-3. 在VeighNa Trader的【全局配置】处进行数据服务配置：
-    * datafeed.name：xt
-    * datafeed.username：token
-    * datafeed.password：填复制的Token
-
-**客户端连接**
-
-1. 连接请先登录迅投极速交易终端，同时确保xtquant模块可以正常加载（点击【下载Python库】-【Python库下载】，下载完成后拷贝“Python库路径”下Lib\site-packages文件夹中的xtquant包到自己使用的Python环境的site_packages文件夹下）。
-2. 在Veighna Trader的【全局配置】处进行数据服务配置：
-    * datafeed.name：xt
-    * datafeed.username：client
-    * datafeed.password：留空
-3. 请注意以客户端方式连接时，需要保持迅投客户端的运行。
+1. 安装依赖：`pip install xtquant-big-convert[redis]`（或本仓库 `pip install .`）。
+2. 在大 QMT 中运行 `BIGQMT_REDIS_DRYRUN`（或 ZMQ 等价入口），并保证 VNPY 侧 Redis/账号配置与 QMT 端 `bigqmt_signal_trader_local_config.py` 一致。
+3. 在 VeighNa 连接 XT 网关：勾选市场、资金账号（须与 `BIGQMT_ACCOUNT_ID` 一致）。无需填写 QMT 路径、Token。
+4. 历史数据服务：全局配置 `datafeed.name = xt` 即可，不再需要迅投研 Token / client 模式。数据来自交易端本地库，缺周期请先在 QMT「数据管理」补充。
