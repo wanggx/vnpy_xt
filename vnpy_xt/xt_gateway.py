@@ -969,6 +969,13 @@ class XtTdApi(XtQuantTraderCallback):
 
         self.connected = True
         self.gateway.write_log("交易接口连接成功")
+        if getattr(self.xt_client, "allow_order_methods", None) is False:
+            self.gateway.write_log(
+                "QMT 端未开放远程下单（rpc_allow_order_methods=False）。"
+                "请在 QMT python 目录的 bigqmt_signal_trader_local_config.py 中"
+                "把 BIGQMT_REDIS_CONFIG['rpc_allow_order_methods'] 改为 True，"
+                "然后重启策略，否则委托会被拒绝。"
+            )
 
         # 订阅交易回调推送
         subscribe_result: int = self.xt_client.subscribe(self.xt_account)
@@ -1000,6 +1007,13 @@ class XtTdApi(XtQuantTraderCallback):
         """委托下单"""
         if not self.connected:
             self.gateway.write_log("委托失败，交易接口尚未连接")
+            return ""
+
+        if getattr(self.xt_client, "allow_order_methods", None) is False:
+            self.gateway.write_log(
+                "委托失败：QMT 端未开放远程下单（rpc_allow_order_methods=False），"
+                "请改配置并重启 QMT 策略"
+            )
             return ""
 
         contract: ContractData = symbol_contract_map.get(req.vt_symbol, None)

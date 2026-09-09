@@ -51,7 +51,7 @@ pip install .
 
 本分支只对接大 QMT。请勿安装官方 `xtquant` MiniQMT 客户端包，否则会与 `xtquant-big-convert` 的同名 shim 冲突。
 
-1. 安装依赖：`pip install xtquant-big-convert[redis]`（或本仓库 `pip install .`）。
+1. 安装本网关及其依赖：`pip install .`（会安装 `xtquant-big-convert[redis]`）。不要把 `xtquant-big-convert` 的源码拷进本仓库。
 2. 在大 QMT 中运行 `BIGQMT_REDIS_DRYRUN`（或 ZMQ 等价入口），并保证 VNPY 侧 Redis/账号配置与 QMT 端 `bigqmt_signal_trader_local_config.py` 一致。
 3. 在 VeighNa 连接 XT 网关：勾选市场、资金账号（须与 `BIGQMT_ACCOUNT_ID` 一致）。无需填写 QMT 路径、Token。
 4. 历史数据服务：全局配置 `datafeed.name = xt` 即可，不再需要迅投研 Token / client 模式。数据来自交易端本地库，缺周期请先在 QMT「数据管理」补充。

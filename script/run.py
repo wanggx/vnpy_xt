@@ -1,8 +1,8 @@
 import os
 import sys
 
-# python script/run.py 时 sys.path[0] 是 script/，找不到仓库根下的
-# 从 xtquant-big-convert 拷来的 bigqmt_signal_trader / xtquant。
+# python script/run.py 时 sys.path[0] 是 script/，需要仓库根才能 import vnpy_xt。
+# xtquant / bigqmt_signal_trader 来自已安装的 xtquant-big-convert，不要再拷进本仓库。
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
