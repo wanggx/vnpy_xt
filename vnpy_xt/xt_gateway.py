@@ -493,42 +493,19 @@ class XtMdApi:
             self.gateway.write_log(f"{label}合约详情进度 {index}/{total}")
 
     def query_stock_contracts(self) -> None:
-        """查询股票合约信息"""
+        """查询股票合约信息（仅沪深京A股，不含ETF和指数）"""
         xt_symbols: list[str] = self._collect_sector_codes([
             "沪深A股",
-            "沪深ETF",
-            "沪深指数",
             "京市A股"
         ])
         total: int = len(xt_symbols)
 
         for index, xt_symbol in enumerate(xt_symbols, start=1):
             try:
-                # 筛选需要的合约
-                product = None
                 symbol, xt_exchange = xt_symbol.split(".")
-
-                if xt_exchange == "SZ":
-                    if xt_symbol.startswith("00"):
-                        product = Product.EQUITY
-                    elif xt_symbol.startswith("159"):
-                        product = Product.FUND
-                    else:
-                        product = Product.INDEX
-                elif xt_exchange == "SH":
-                    if xt_symbol.startswith(("60", "68")):
-                        product = Product.EQUITY
-                    elif xt_symbol.startswith("51"):
-                        product = Product.FUND
-                    else:
-                        product = Product.INDEX
-                elif xt_exchange == "BJ":
-                    product = Product.EQUITY
-
-                if not product:
+                if xt_exchange not in ("SH", "SZ", "BJ"):
                     continue
 
-                # 生成并推送合约信息
                 data: dict = xtdata.get_instrument_detail(xt_symbol)
                 if data is None:
                     continue
@@ -537,7 +514,7 @@ class XtMdApi:
                     symbol=symbol,
                     exchange=EXCHANGE_XT2VT[xt_exchange],
                     name=data["InstrumentName"],
-                    product=product,
+                    product=Product.EQUITY,
                     size=data["VolumeMultiple"],
                     pricetick=data["PriceTick"],
                     history_data=False,
