@@ -23,6 +23,7 @@ from bigqmt_signal_trader.xtquant_compat import (
 )
 
 from vnpy.event import EventEngine, EVENT_TIMER, Event
+from vnpy.trader.event import EVENT_TICK_UNSUBSCRIBE
 from vnpy.trader.gateway import BaseGateway
 from vnpy.trader.object import (
     OrderRequest,
@@ -678,6 +679,7 @@ class XtMdApi:
 
         xt_symbol: str = req.symbol + "." + xt_exchange
         subscriber: tuple[str, str] = (req.app_name, req.subscriber_name)
+        removed_last_subscriber: bool = False
 
         with self.subscription_lock:
             # 没有该标的的订阅记录时无需处理。
@@ -700,18 +702,18 @@ class XtMdApi:
             # 最后一个订阅者已经退出，清理逻辑状态并使用保存的订阅号退订XT行情。
             self.subscribers.pop(xt_symbol)
             subscription_id: int | None = self.subscription_ids.pop(xt_symbol, None)
-            if subscription_id is None:
-                self.gateway.write_log(
-                    f"行情退订完成，当前订阅标的数量：{len(self.subscription_ids)}"
-                )
-                return
+            if subscription_id is not None:
+                xtdata.unsubscribe_quote(subscription_id)
 
-            xtdata.unsubscribe_quote(subscription_id)
             self.subscribed.discard(xt_symbol)
             self.last_volume.pop(req.vt_symbol, None)
+            removed_last_subscriber = True
             self.gateway.write_log(
                 f"行情退订完成，当前订阅标的数量：{len(self.subscription_ids)}"
             )
+
+        if removed_last_subscriber:
+            self.gateway.on_event(EVENT_TICK_UNSUBSCRIBE, req)
 
     def close(self) -> None:
         """关闭连接"""

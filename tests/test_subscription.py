@@ -4,6 +4,7 @@ from pytest import MonkeyPatch
 
 from vnpy.event import EventEngine
 from vnpy.trader.constant import Exchange
+from vnpy.trader.event import EVENT_TICK_UNSUBSCRIBE
 from vnpy.trader.object import SubscribeRequest
 
 from vnpy_xt.xt_gateway import (
@@ -47,9 +48,11 @@ def test_unsubscribe_after_last_subscriber(monkeypatch: MonkeyPatch) -> None:
 
         md_api.unsubscribe(cta_req)
         unsubscribe_quote.assert_not_called()
+        gateway.on_event.assert_not_called()
 
         md_api.unsubscribe(portfolio_req)
         unsubscribe_quote.assert_called_once_with(101)
+        gateway.on_event.assert_called_once_with(EVENT_TICK_UNSUBSCRIBE, portfolio_req)
         assert not md_api.subscribed
         assert not md_api.subscription_ids
         assert not md_api.subscribers
@@ -75,6 +78,7 @@ def test_default_subscriber_can_unsubscribe(monkeypatch: MonkeyPatch) -> None:
         md_api.unsubscribe(req)
 
         unsubscribe_quote.assert_called_once_with(102)
+        gateway.on_event.assert_called_once_with(EVENT_TICK_UNSUBSCRIBE, req)
     finally:
         symbol_contract_map.pop(req.vt_symbol, None)
 
