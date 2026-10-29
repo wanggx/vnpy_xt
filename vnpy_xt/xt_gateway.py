@@ -1,6 +1,7 @@
 from datetime import datetime
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from threading import Lock, Thread
+from time import monotonic
 from typing import Any
 
 from xtquant import xtconstant
@@ -118,6 +119,8 @@ CHINA_TZ = ZoneInfo("Asia/Shanghai")       # 中国时区
 MIN_SUBSCRIPTION_COUNT: int = 50            # 用户可配置的订阅上限不得低于该值
 DEFAULT_SUBSCRIPTION_COUNT: int = 500       # 连接界面默认最大订阅数量
 CONTRACT_DETAIL_LOG_STEP: int = 500         # 合约详情进度日志间隔
+CONTRACT_DETAIL_BATCH_SIZE: int = 200       # 每次RPC批量查询合约详情
+CONTRACT_DETAIL_TIMEOUT_SECONDS: float = 300.0
 
 
 # 全局缓存字典
@@ -466,7 +469,7 @@ class XtMdApi:
             f"股票={'是' if self.stock_active else '否'} "
             f"期货={'是' if self.futures_active else '否'} "
             f"期权={'是' if self.option_active else '否'} "
-            "（RPC 逐只拉详情，股票全市场可能需要一两分钟）"
+            "（合约详情使用批量RPC，兼容旧客户端时逐只查询）"
         )
 
         if self.stock_active:
@@ -491,7 +494,56 @@ class XtMdApi:
 
     def _log_detail_progress(self, label: str, index: int, total: int) -> None:
         if index % CONTRACT_DETAIL_LOG_STEP == 0:
-            self.gateway.write_log(f"{label}合约详情进度 {index}/{total}")
+            self.gateway.write_log(f"{label}合约处理进度 {index}/{total}")
+
+    def _iter_instrument_detail_batches(
+        self,
+        label: str,
+        xt_symbols: list[str]
+    ) -> Iterator[tuple[list[str], dict[str, dict]]]:
+        """Read contract details in bounded RPC batches to reduce pipe round trips."""
+        batch_getter: Callable | None = getattr(
+            xtdata, "get_instrument_detail_batch", None
+        )
+        total: int = len(xt_symbols)
+
+        for offset in range(0, total, CONTRACT_DETAIL_BATCH_SIZE):
+            batch_symbols: list[str] = xt_symbols[
+                offset:offset + CONTRACT_DETAIL_BATCH_SIZE
+            ]
+            started: float = monotonic()
+
+            if callable(batch_getter):
+                details = batch_getter(
+                    batch_symbols,
+                    timeout_seconds=CONTRACT_DETAIL_TIMEOUT_SECONDS
+                )
+            else:
+                details = {
+                    xt_symbol: xtdata.get_instrument_detail(xt_symbol) or {}
+                    for xt_symbol in batch_symbols
+                }
+
+            if not isinstance(details, dict):
+                raise TypeError(
+                    f"{label}合约详情批量RPC应返回dict，实际为{type(details).__name__}"
+                )
+
+            missing_symbols: list[str] = [
+                xt_symbol for xt_symbol in batch_symbols
+                if xt_symbol not in details
+            ]
+            if missing_symbols:
+                raise RuntimeError(
+                    f"{label}合约详情批量RPC缺少结果：{missing_symbols[:5]}"
+                )
+
+            completed: int = offset + len(batch_symbols)
+            self.gateway.write_log(
+                f"{label}合约详情批量进度 {completed}/{total}，"
+                f"本批耗时 {monotonic() - started:.1f} 秒"
+            )
+            yield batch_symbols, details
 
     def query_stock_contracts(self) -> None:
         """查询股票合约信息（仅沪深京A股，不含ETF和指数）"""
@@ -500,34 +552,39 @@ class XtMdApi:
             "京市A股"
         ])
         total: int = len(xt_symbols)
+        processed: int = 0
 
-        for index, xt_symbol in enumerate(xt_symbols, start=1):
-            try:
-                symbol, xt_exchange = xt_symbol.split(".")
-                if xt_exchange not in ("SH", "SZ", "BJ"):
-                    continue
+        for batch_symbols, details in self._iter_instrument_detail_batches(
+            "股票", xt_symbols
+        ):
+            for xt_symbol in batch_symbols:
+                processed += 1
+                try:
+                    symbol, xt_exchange = xt_symbol.split(".")
+                    if xt_exchange not in ("SH", "SZ", "BJ"):
+                        continue
 
-                data: dict = xtdata.get_instrument_detail(xt_symbol)
-                if data is None:
-                    continue
+                    data: dict = details[xt_symbol]
+                    if not data:
+                        continue
 
-                contract: ContractData = ContractData(
-                    symbol=symbol,
-                    exchange=EXCHANGE_XT2VT[xt_exchange],
-                    name=data["InstrumentName"],
-                    product=Product.EQUITY,
-                    size=data["VolumeMultiple"],
-                    pricetick=data["PriceTick"],
-                    history_data=False,
-                    gateway_name=self.gateway_name
-                )
+                    contract: ContractData = ContractData(
+                        symbol=symbol,
+                        exchange=EXCHANGE_XT2VT[xt_exchange],
+                        name=data["InstrumentName"],
+                        product=Product.EQUITY,
+                        size=data["VolumeMultiple"],
+                        pricetick=data["PriceTick"],
+                        history_data=False,
+                        gateway_name=self.gateway_name
+                    )
 
-                symbol_contract_map[contract.vt_symbol] = contract
-                symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
+                    symbol_contract_map[contract.vt_symbol] = contract
+                    symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
 
-                self.gateway.on_contract(contract)
-            finally:
-                self._log_detail_progress("股票", index, total)
+                    self.gateway.on_contract(contract)
+                finally:
+                    self._log_detail_progress("股票", processed, total)
 
     def query_future_contracts(self) -> None:
         """查询期货合约信息"""
@@ -540,49 +597,51 @@ class XtMdApi:
             "广期所期货"
         ])
         total: int = len(xt_symbols)
+        processed: int = 0
 
-        for index, xt_symbol in enumerate(xt_symbols, start=1):
-            try:
-                # 筛选需要的合约
-                product = None
-                symbol, xt_exchange = xt_symbol.split(".")
+        for batch_symbols, details in self._iter_instrument_detail_batches(
+            "期货", xt_symbols
+        ):
+            for xt_symbol in batch_symbols:
+                processed += 1
+                try:
+                    # 筛选需要的合约
+                    symbol, xt_exchange = xt_symbol.split(".")
 
-                if xt_exchange == "ZF" and len(symbol) > 6 and "&" not in symbol:
-                    product = Product.OPTION
-                elif xt_exchange in ("IF", "GF") and "-" in symbol:
-                    product = Product.OPTION
-                elif xt_exchange in ("DF", "INE", "SF") and ("C" in symbol or "P" in symbol) and "SP" not in symbol:
-                    product = Product.OPTION
-                else:
-                    product = Product.FUTURES
+                    if xt_exchange == "ZF" and len(symbol) > 6 and "&" not in symbol:
+                        product = Product.OPTION
+                    elif xt_exchange in ("IF", "GF") and "-" in symbol:
+                        product = Product.OPTION
+                    elif xt_exchange in ("DF", "INE", "SF") and ("C" in symbol or "P" in symbol) and "SP" not in symbol:
+                        product = Product.OPTION
+                    else:
+                        product = Product.FUTURES
 
-                # 生成并推送合约信息
-                if product == Product.OPTION:
-                    data: dict = xtdata.get_instrument_detail(xt_symbol, True)
-                else:
-                    data = xtdata.get_instrument_detail(xt_symbol)
-
-                if not data["ExpireDate"]:
-                    if "00" not in symbol:
+                    data: dict = details[xt_symbol]
+                    if not data:
                         continue
 
-                contract: ContractData = ContractData(
-                    symbol=symbol,
-                    exchange=EXCHANGE_XT2VT[xt_exchange],
-                    name=data["InstrumentName"],
-                    product=product,
-                    size=data["VolumeMultiple"],
-                    pricetick=data["PriceTick"],
-                    history_data=False,
-                    gateway_name=self.gateway_name
-                )
+                    if not data["ExpireDate"]:
+                        if "00" not in symbol:
+                            continue
 
-                symbol_contract_map[contract.vt_symbol] = contract
-                symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
+                    contract: ContractData = ContractData(
+                        symbol=symbol,
+                        exchange=EXCHANGE_XT2VT[xt_exchange],
+                        name=data["InstrumentName"],
+                        product=product,
+                        size=data["VolumeMultiple"],
+                        pricetick=data["PriceTick"],
+                        history_data=False,
+                        gateway_name=self.gateway_name
+                    )
 
-                self.gateway.on_contract(contract)
-            finally:
-                self._log_detail_progress("期货", index, total)
+                    symbol_contract_map[contract.vt_symbol] = contract
+                    symbol_limit_map[contract.vt_symbol] = (data["UpStopPrice"], data["DownStopPrice"])
+
+                    self.gateway.on_contract(contract)
+                finally:
+                    self._log_detail_progress("期货", processed, total)
 
     def query_option_contracts(self) -> None:
         """查询期权合约信息"""
@@ -597,21 +656,34 @@ class XtMdApi:
             "广期所期权"
         ])
         total: int = len(xt_symbols)
+        processed: int = 0
 
-        for index, xt_symbol in enumerate(xt_symbols, start=1):
-            try:
-                _, xt_exchange = xt_symbol.split(".")
+        for batch_symbols, details in self._iter_instrument_detail_batches(
+            "期权", xt_symbols
+        ):
+            for xt_symbol in batch_symbols:
+                processed += 1
+                try:
+                    _, xt_exchange = xt_symbol.split(".")
+                    data: dict = details[xt_symbol]
+                    if not data:
+                        continue
 
-                if xt_exchange in {"SHO", "SZO"}:
-                    contract = process_etf_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
-                else:
-                    contract = process_futures_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
+                    get_detail: Callable = lambda code, *_args: details.get(code) or {}
+                    if xt_exchange in {"SHO", "SZO"}:
+                        contract = process_etf_option(
+                            get_detail, xt_symbol, self.gateway_name
+                        )
+                    else:
+                        contract = process_futures_option(
+                            get_detail, xt_symbol, self.gateway_name
+                        )
 
-                if contract:
-                    symbol_contract_map[contract.vt_symbol] = contract
-                    self.gateway.on_contract(contract)
-            finally:
-                self._log_detail_progress("期权", index, total)
+                    if contract:
+                        symbol_contract_map[contract.vt_symbol] = contract
+                        self.gateway.on_contract(contract)
+                finally:
+                    self._log_detail_progress("期权", processed, total)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """按订阅者汇总需求，并在必要时创建XT底层行情订阅。"""
