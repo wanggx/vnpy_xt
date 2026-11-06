@@ -13,12 +13,14 @@ from .xt_gateway import generate_datetime
 
 INTERVAL_VT2XT: dict[Interval, str] = {
     Interval.MINUTE: "1m",
+    Interval.HOUR: "1h",
     Interval.DAILY: "1d",
     Interval.TICK: "tick"
 }
 
 INTERVAL_ADJUSTMENT_MAP: dict[Interval, timedelta] = {
     Interval.MINUTE: timedelta(minutes=1),
+    Interval.HOUR: timedelta(hours=1),    # 1h Bar 标记区间结束，减回区间开始
     Interval.DAILY: timedelta()         # 日线无需进行调整
 }
 
