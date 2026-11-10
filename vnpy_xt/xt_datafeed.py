@@ -24,6 +24,11 @@ INTERVAL_ADJUSTMENT_MAP: dict[Interval, timedelta] = {
     Interval.DAILY: timedelta()         # 日线无需进行调整
 }
 
+# 历史 K 线复权方式：front=前复权 / back=后复权 / none=不复权。
+# 默认前复权，与 script/select_near_ma_*.py 的 DIVIDEND_TYPE 口径一致；Tick 是逐笔
+# 真实成交价，不做复权（见 get_history_df）。
+DIVIDEND_TYPE: str = "front"
+
 EXCHANGE_VT2XT: dict[Exchange, str] = {
     Exchange.SSE: "SH",
     Exchange.SZSE: "SZ",
@@ -251,6 +256,9 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
     if exchange in (Exchange.SSE, Exchange.SZSE) and len(symbol) > 6:
         xt_symbol += "O"
 
+    # 复权方式：K 线默认前复权（DIVIDEND_TYPE），Tick 不做复权
+    dividend_type: str = "none" if interval == Interval.TICK else DIVIDEND_TYPE
+
     try:
         data: dict = xtdata.get_market_data_ex(
             field_list=[],
@@ -259,7 +267,7 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
             start_time=start,
             end_time=end,
             count=-1,
-            dividend_type="none",
+            dividend_type=dividend_type,
             fill_data=False,
         ) or {}
     except Exception as ex:
