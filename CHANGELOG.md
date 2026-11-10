@@ -1,14 +1,16 @@
 # 1.4.6
 
 1. 修复XtGateway断线重连时的传参错误
-2. 历史 K 线改为默认**前复权**：`XtDatafeed` 取数固定 `dividend_type="none"`，导致
-   数据管理（DataManager）下载入库的日线/分钟线是不复权价，除权除息日跳空、均线与
-   回测失真。现新增 `DIVIDEND_TYPE = "front"`（前复权）并用于所有 K 线周期；Tick 是
-   逐笔真实成交价，仍走 `none`。
+2. 历史 K 线恢复**等比前复权**：`XtDatafeed` 从 `[Mod] 修改历史数据复权方式`（00572ab）起
+   一直用 `"front_ratio"`，`501f411 Fix XT datafeed and gateway handling`（2026-07-10）里
+   被改成 `"none"`（不复权），之后切大 QMT RPC 时又沿用了下来——于是数据管理（DataManager）
+   下载入库的日线/分钟线是不复权价，除权除息日跳空、均线与回测失真。现恢复为
+   `DIVIDEND_TYPE = "front_ratio"` 并用于所有 K 线周期；Tick 是逐笔真实成交价，仍走 `none`。
    注意：已入库的历史数据不会自动变化，需在数据管理里用「重下」（`DownloadMode.REPLACE`）
    重新下载；另外前复权价会随每次分红整体位移，而「追加」模式只补缺口、不重下历史，
-   长期使用建议分红后对该标的按需「重下」，或改用 `DIVIDEND_TYPE = "back"`（后复权，
-   历史段不随时间变化）。
+   长期使用建议分红后对该标的按需「重下」，或改用 `"back_ratio"`（等比后复权，历史段
+   不随时间变化）。复权数据由大 QMT 服务端现场计算，需先有原始 K 线（`download_history_data2`
+   会自动先下原始数据）；复权请求不走 FormulaServer 快路径，会回退 RPC，速度比不复权慢。
 
 # 1.4.5
 

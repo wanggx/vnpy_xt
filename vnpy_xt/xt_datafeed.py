@@ -24,10 +24,12 @@ INTERVAL_ADJUSTMENT_MAP: dict[Interval, timedelta] = {
     Interval.DAILY: timedelta()         # 日线无需进行调整
 }
 
-# 历史 K 线复权方式：front=前复权 / back=后复权 / none=不复权。
-# 默认前复权，与 script/select_near_ma_*.py 的 DIVIDEND_TYPE 口径一致；Tick 是逐笔
-# 真实成交价，不做复权（见 get_history_df）。
-DIVIDEND_TYPE: str = "front"
+# 历史 K 线复权方式：none=不复权，front/back 为普通前/后复权，
+# front_ratio/back_ratio 为等比前/后复权。
+# 默认等比前复权（front_ratio）：与 vnpy_xt 早期版本（00572ab / 38a1357）一致，
+# 桥的 API 文档也推荐它做回测——等比复权不会因配股增发产生价格跳变。
+# Tick 是逐笔真实成交价，不做复权（见 get_history_df）。
+DIVIDEND_TYPE: str = "front_ratio"
 
 EXCHANGE_VT2XT: dict[Exchange, str] = {
     Exchange.SSE: "SH",
@@ -256,7 +258,7 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
     if exchange in (Exchange.SSE, Exchange.SZSE) and len(symbol) > 6:
         xt_symbol += "O"
 
-    # 复权方式：K 线默认前复权（DIVIDEND_TYPE），Tick 不做复权
+    # 复权方式：K 线默认等比前复权（DIVIDEND_TYPE），Tick 不做复权
     dividend_type: str = "none" if interval == Interval.TICK else DIVIDEND_TYPE
 
     try:
