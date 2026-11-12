@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, time
+from datetime import date, datetime, timedelta, time
 from collections.abc import Callable
 
 from pandas import DataFrame
@@ -143,6 +143,77 @@ class XtDatafeed(BaseDatafeed):
             history.append(bar)
 
         return history
+
+    def download_bar_history(self, req: HistoryRequest, output: Callable = print) -> bool:
+        """主动让大 QMT 服务端把该区间原始 K 线补进本地缓存。
+
+        query_bar_history 只读 QMT 本地缓存（get_market_data_ex），要确认「源头到底
+        有没有这段数据」必须先拉一次（download_history_data2）。返回是否拉取成功。
+        """
+        if not self.inited:
+            self.init(output)
+
+        xt_interval: str | None = INTERVAL_VT2XT.get(req.interval, None)
+        if not xt_interval:
+            output(f"向 QMT 补拉历史数据失败：不支持的周期 {req.interval.value}")
+            return False
+
+        xt_symbol: str = req.symbol + "." + EXCHANGE_VT2XT[req.exchange]
+        if req.exchange in (Exchange.SSE, Exchange.SZSE) and len(req.symbol) > 6:
+            xt_symbol += "O"
+
+        start: str = req.start.strftime("%Y%m%d")
+        end: str = (req.end + timedelta(1)).strftime("%Y%m%d")
+        try:
+            xtdata.download_history_data2([xt_symbol], xt_interval, start, end)
+        except Exception as ex:
+            output(f"向 QMT 补拉 {xt_symbol} {xt_interval} 失败：{ex}")
+            return False
+        return True
+
+    def get_trading_dates(
+        self, start: date, end: date, market: str = "SH", output: Callable = print,
+    ) -> list[date] | None:
+        """向 QMT 取 [start, end] 的交易日历（已剔除节假日）。
+
+        取不到时返回 None，调用方退化为「只排除周末」的粗日历。注意该调用在部分
+        终端上很慢（国金 2.1.19.0 实测约 2s/次），一次检查只应该调一次。
+        """
+        if not self.inited:
+            self.init(output)
+
+        try:
+            raw: list = xtdata.get_trading_dates(
+                market, start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+            ) or []
+        except Exception as ex:
+            output(f"取交易日历失败：{ex}")
+            return None
+
+        days: list[date] = []
+        for value in raw:
+            parsed: date | None = self._to_date(value)
+            if parsed is not None and start <= parsed <= end:
+                days.append(parsed)
+        return sorted(set(days)) or None
+
+    @staticmethod
+    def _to_date(value: object) -> date | None:
+        """把 QMT 返回的「毫秒时间戳 / YYYYMMDD 整数 / 字符串 / date」统一成 date。"""
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        text: str = str(value).strip()
+        if text.isdigit():
+            if len(text) > 10:      # 毫秒时间戳
+                return datetime.fromtimestamp(int(text) / 1000).date()
+            if len(text) == 8:      # YYYYMMDD
+                return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+        try:
+            return datetime.fromisoformat(text).date()
+        except ValueError:
+            return None
 
     def query_tick_history(self, req: HistoryRequest, output: Callable = print) -> list[TickData] | None:
         """查询Tick数据"""

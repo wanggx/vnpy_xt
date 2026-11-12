@@ -1,7 +1,15 @@
 # 1.4.6
 
 1. 修复XtGateway断线重连时的传参错误
-2. 历史 K 线恢复**等比前复权**：`XtDatafeed` 从 `[Mod] 修改历史数据复权方式`（00572ab）起
+2. 新增 `XtDatafeed.get_trading_dates(start, end)`：向大 QMT 取已剔除节假日的
+   **交易日历**，供数据完整性检查判断"哪天本来就该有数据"。取不到时返回 `None`
+   （调用方退化为只排除周末的粗日历）。该调用在部分终端上较慢（国金 2.1.19.0 实测
+   约 2s/次），调用方应按区间缓存、一次检查只取一次。
+3. 新增 `XtDatafeed.download_bar_history(req)`：主动让大 QMT 服务端把该区间**原始**
+   K 线补进本地缓存（`download_history_data2`），供数据完整性检查「回源复核」用——
+   `query_bar_history` 只读 QMT 本地缓存，不先补拉就无法区分「源头没有这段数据」和
+   「本地缓存没同步」。只在需要时调用，不影响正常下载流程。
+4. 历史 K 线恢复**等比前复权**：`XtDatafeed` 从 `[Mod] 修改历史数据复权方式`（00572ab）起
    一直用 `"front_ratio"`，`501f411 Fix XT datafeed and gateway handling`（2026-07-10）里
    被改成 `"none"`（不复权），之后切大 QMT RPC 时又沿用了下来——于是数据管理（DataManager）
    下载入库的日线/分钟线是不复权价，除权除息日跳空、均线与回测失真。现恢复为
