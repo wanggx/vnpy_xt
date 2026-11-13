@@ -44,6 +44,21 @@ EXCHANGE_VT2XT: dict[Exchange, str] = {
 }
 
 
+def is_index_symbol(symbol: str, exchange: Exchange) -> bool:
+    """是否为大盘指数代码（按 A 股命名空间判定）。
+
+    上证指数族是 ``000xxx.SH``（000001 上证综指、000300 沪深300、000905 中证500…），
+    深证指数族是 ``399xxx.SZ``（399001 深证成指、399006 创业板指…）。
+    上交所个股一律 6 开头，所以 ``SSE + 000`` 不会误伤股票。
+    """
+    code: str = str(symbol).strip()
+    if exchange == Exchange.SSE:
+        return code.startswith("000")
+    if exchange == Exchange.SZSE:
+        return code.startswith("399")
+    return False
+
+
 class XtDatafeed(BaseDatafeed):
     """大 QMT RPC 历史数据接口（不经 MiniQMT / 迅投研 xtdatacenter）"""
 
@@ -75,6 +90,10 @@ class XtDatafeed(BaseDatafeed):
                 return history
 
         df: DataFrame = get_history_df(req, output)
+        if df.empty and req.interval != Interval.TICK:
+            # 复权口径可能对该标的不成立（指数最常见：没有除权数据，用 front/back
+            # 查会回空表）。换 none 再试一次，避免"明明有数据却下不到"。
+            df = get_history_df(req, output, dividend_type="none")
         if df.empty:
             return history
 
@@ -144,11 +163,21 @@ class XtDatafeed(BaseDatafeed):
 
         return history
 
-    def download_bar_history(self, req: HistoryRequest, output: Callable = print) -> bool:
+    def download_bar_history(
+        self,
+        req: HistoryRequest,
+        output: Callable = print,
+        download_timeout_seconds: float = 30.0,
+        data_wait_seconds: float = 5.0,
+    ) -> bool:
         """主动让大 QMT 服务端把该区间原始 K 线补进本地缓存。
 
         query_bar_history 只读 QMT 本地缓存（get_market_data_ex），要确认「源头到底
         有没有这段数据」必须先拉一次（download_history_data2）。返回是否拉取成功。
+
+        ``download_timeout_seconds`` / ``data_wait_seconds`` 是桥侧等待预算：默认值
+        （180s / 10s）对一个下不下来的标的足够把界面卡死三分钟，所以这里给短预算，
+        拉不到就当没有，由调用方记「跳过」。
         """
         if not self.inited:
             self.init(output)
@@ -165,7 +194,21 @@ class XtDatafeed(BaseDatafeed):
         start: str = req.start.strftime("%Y%m%d")
         end: str = (req.end + timedelta(1)).strftime("%Y%m%d")
         try:
-            xtdata.download_history_data2([xt_symbol], xt_interval, start, end)
+            xtdata.download_history_data2(
+                [xt_symbol],
+                xt_interval,
+                start,
+                end,
+                download_timeout_seconds=download_timeout_seconds,
+                data_wait_seconds=data_wait_seconds,
+            )
+        except TypeError:
+            # 老版本桥没有这两个参数：退回两参数调用（预算由桥的默认值决定）
+            try:
+                xtdata.download_history_data2([xt_symbol], xt_interval, start, end)
+            except Exception as ex:  # noqa: BLE001
+                output(f"向 QMT 补拉 {xt_symbol} {xt_interval} 失败：{ex}")
+                return False
         except Exception as ex:
             output(f"向 QMT 补拉 {xt_symbol} {xt_interval} 失败：{ex}")
             return False
@@ -303,8 +346,16 @@ def _level_list(values: object, size: int = 5) -> list[float]:
     return [float(item or 0) for item in data]
 
 
-def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
-    """从大 QMT RPC 取历史 DataFrame（读终端本地/实时库，不经迅投研）。"""
+def get_history_df(
+    req: HistoryRequest,
+    output: Callable = print,
+    dividend_type: str | None = None,
+) -> DataFrame:
+    """从大 QMT RPC 取历史 DataFrame（读终端本地/实时库，不经迅投研）。
+
+    ``dividend_type`` 不传时按标的自动选：Tick 与**指数**一律 ``none``
+    （指数没有除权除息，QMT 用 front/back 之类的复权口径查指数会直接回空表）。
+    """
     symbol: str = req.symbol
     exchange: Exchange = req.exchange
     start_dt: datetime = req.start
@@ -329,12 +380,23 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
     if exchange in (Exchange.SSE, Exchange.SZSE) and len(symbol) > 6:
         xt_symbol += "O"
 
-    # 复权方式：K 线默认等比前复权（DIVIDEND_TYPE），Tick 不做复权
-    dividend_type: str = "none" if interval == Interval.TICK else DIVIDEND_TYPE
+    # 复权方式：K 线默认等比前复权（DIVIDEND_TYPE）；Tick 与指数不做复权
+    if dividend_type is None:
+        no_adjust: bool = interval == Interval.TICK or is_index_symbol(symbol, exchange)
+        dividend_type = "none" if no_adjust else DIVIDEND_TYPE
+
+    # 只要用到的列：空 field_list 意味着"全部 11 列"，桥只能走 RPC（实测 5.8s/次）；
+    # 点名这 6 列 + time 可以走 FormulaServer（0.015s/次），分钟线分段下载快两个量级。
+    # Tick 的字段不同，保持空列表。
+    field_list: list[str] = (
+        []
+        if interval == Interval.TICK
+        else ["time", "open", "high", "low", "close", "volume", "amount"]
+    )
 
     try:
         data: dict = xtdata.get_market_data_ex(
-            field_list=[],
+            field_list=field_list,
             stock_list=[xt_symbol],
             period=xt_interval,
             start_time=start,
@@ -342,9 +404,35 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
             count=-1,
             dividend_type=dividend_type,
             fill_data=False,
+            # 只读本地库，不触发桥侧的"自愈下载"：heal=True 时单只标的读空会
+            # 现发一次 download_history_data2（RPC 最长等 60s）再重查，选一只
+            # 指数就能把界面卡掉一两分钟。补数走 download_bar_history 显式触发。
+            heal=False,
         ) or {}
+    except TypeError:
+        # 老版本桥没有 heal 参数
+        try:
+            data = xtdata.get_market_data_ex(
+                field_list=field_list,
+                stock_list=[xt_symbol],
+                period=xt_interval,
+                start_time=start,
+                end_time=end,
+                count=-1,
+                dividend_type=dividend_type,
+                fill_data=False,
+            ) or {}
+        except Exception as ex:
+            output(
+                f"大 QMT 查询 {xt_symbol} 的 {xt_interval} 失败"
+                f"（{start_dt:%Y-%m-%d}~{req.end:%Y-%m-%d}，复权={dividend_type}）：{ex}"
+            )
+            return DataFrame()
     except Exception as ex:
-        output(f"大 QMT 查询历史数据失败：{ex}")
+        output(
+            f"大 QMT 查询 {xt_symbol} 的 {xt_interval} 失败"
+            f"（{start_dt:%Y-%m-%d}~{req.end:%Y-%m-%d}，复权={dividend_type}）：{ex}"
+        )
         return DataFrame()
 
     df = None
@@ -358,7 +446,8 @@ def get_history_df(req: HistoryRequest, output: Callable = print) -> DataFrame:
                     break
     if df is None or not isinstance(df, DataFrame) or df.empty:
         output(
-            f"大 QMT 未返回 {xt_symbol} 的 {xt_interval} 数据。"
+            f"大 QMT 未返回 {xt_symbol} 的 {xt_interval} 数据"
+            f"（{start_dt:%Y-%m-%d}~{req.end:%Y-%m-%d}，复权={dividend_type}）。"
             "请在交易端「数据管理」补充对应周期后再查。"
         )
         return DataFrame()
