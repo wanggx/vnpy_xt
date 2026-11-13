@@ -1,8 +1,28 @@
 from datetime import datetime
 from collections.abc import Callable, Iterator
-from threading import Lock, Thread
+from threading import Event as ThreadEvent, Lock, Thread
 from time import monotonic
 from typing import Any
+
+try:  # 传输层异常：管道超时/断连都说明「网关已不可用」，要触发重连
+    from bigqmt_signal_trader.transports.base import (
+        TransportError,
+        TransportTimeout,
+    )
+    _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (TransportError, TransportTimeout)
+except Exception:  # noqa: BLE001 - 兼容层版本差异时退回按异常名判断
+    _TRANSPORT_ERRORS = ()
+
+# 按异常名兜底识别「管道不可用」（兼容被包装过的传输异常）
+_TRANSPORT_ERROR_NAMES: frozenset[str] = frozenset({
+    "TransportError",
+    "TransportTimeout",
+    "ConnectionResetError",
+    "ConnectionRefusedError",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+    "TimeoutError",
+})
 
 from xtquant import xtconstant
 from xtquant.xttype import (
@@ -122,6 +142,10 @@ CONTRACT_DETAIL_LOG_STEP: int = 500         # 合约详情进度日志间隔
 CONTRACT_DETAIL_BATCH_SIZE: int = 200       # 每次RPC批量查询合约详情
 CONTRACT_DETAIL_TIMEOUT_SECONDS: float = 300.0
 
+# 交易通道断线（管道超时/网关停止）后的自动重连退避
+RECONNECT_BASE_DELAY: float = 2.0           # 首次重连等待秒数
+RECONNECT_MAX_DELAY: float = 60.0           # 退避上限
+
 
 # 全局缓存字典
 symbol_contract_map: dict[str, ContractData] = {}       # 合约数据
@@ -160,6 +184,13 @@ class XtGateway(BaseGateway):
         self.count: int = 0
 
         self.thread: Thread | None = None
+        # 查询线程：定时查询在大 QMT 管道上可能阻塞到超时，绝不能占住事件引擎线程
+        self._query_thread: Thread | None = None
+        self._query_error_at: dict[str, float] = {}
+        # 交易通道断线自动重连（管道超时 / 网关停止后）
+        self._reconnect_thread: Thread | None = None
+        self._reconnect_stop: ThreadEvent = ThreadEvent()
+        self._reconnect_attempt: int = 0
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -273,21 +304,141 @@ class XtGateway(BaseGateway):
 
     def close(self) -> None:
         """关闭接口"""
+        self.stop_reconnect()
         self.md_api.close()
 
         if self.trading:
             self.td_api.close()
 
     def process_timer_event(self, event: Event) -> None:
-        """定时事件处理"""
+        """定时事件处理。
+
+        大 QMT 查询走命名管道 RPC，管道卡住时会抛 TransportTimeout；这些异常
+        绝不能冒到事件引擎线程里（那里一挂，整个 vnpy 主进程的事件分发就停了）。
+        所以：① 查询放到独立线程跑，事件引擎线程永不阻塞；② 任何异常都在本层
+        吃掉并记日志（同一类错误 30s 内只记一次）；③ 上一轮还没返回就跳过本轮，
+        避免管道卡住时任务越堆越多。
+        """
         self.count += 1
         if self.count < 2:
             return
         self.count = 0
 
+        if not self.query_functions:
+            return
+
         func = self.query_functions.pop(0)
-        func()
         self.query_functions.append(func)
+
+        if self._query_thread is not None and self._query_thread.is_alive():
+            return
+
+        self._query_thread = Thread(
+            target=self._run_query,
+            args=(func,),
+            daemon=True,
+            name=f"xt-query-{getattr(func, '__name__', 'query')}",
+        )
+        self._query_thread.start()
+
+    def _run_query(self, func: Callable) -> None:
+        """在工作线程里执行一次定时查询，异常只记日志不外抛。"""
+        try:
+            func()
+        except Exception as ex:  # noqa: BLE001 - 管道超时/断连都不能带走主进程
+            self._log_query_error(getattr(func, "__name__", "query"), ex)
+
+    def _log_query_error(self, name: str, ex: Exception) -> None:
+        """查询/下单异常：隔离 + 限流日志；属于传输层故障则标记断线并触发重连。"""
+        now: float = monotonic()
+        last: float = self._query_error_at.get(name, 0.0)
+        if now - last >= 30:
+            self._query_error_at[name] = now
+            self.write_log(
+                f"网关操作 {name} 异常（已在网关内隔离，不影响主进程）："
+                f"{type(ex).__name__}: {ex}"
+            )
+        if self._is_transport_error(ex):
+            self.on_transport_error(name, ex)
+
+    @staticmethod
+    def _is_transport_error(ex: BaseException) -> bool:
+        """判断是否为「管道不可用」类错误（网关停止/超时/断连）。"""
+        if _TRANSPORT_ERRORS and isinstance(ex, _TRANSPORT_ERRORS):
+            return True
+        names: set[str] = {cls.__name__ for cls in type(ex).__mro__}
+        return bool(names & _TRANSPORT_ERROR_NAMES)
+
+    def on_transport_error(self, source: str, ex: BaseException) -> None:
+        """交易通道不可用：标记断线（停止后续查询）并按退避启动自动重连。"""
+        td = self.td_api
+        if td is not None:
+            td.connected = False
+        self.start_reconnect(f"{source}: {type(ex).__name__}")
+
+    def start_reconnect(self, reason: str) -> None:
+        """按退避启动自动重连（已有重连线程在跑时直接返回）。"""
+        if not self.trading:
+            return
+        if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+            return
+        self._reconnect_stop.clear()
+        self._reconnect_attempt = 0
+        self._reconnect_thread = Thread(
+            target=self._reconnect_loop,
+            args=(reason,),
+            daemon=True,
+            name="xt-td-reconnect",
+        )
+        self._reconnect_thread.start()
+
+    def _reconnect_loop(self, reason: str) -> None:
+        """按指数退避重连交易通道；成功后定时查询自动恢复。"""
+        td: XtTdApi = self.td_api
+        delay: float = RECONNECT_BASE_DELAY
+        self.write_log(
+            f"交易通道不可用（{reason}），已暂停定时查询，"
+            f"{delay:.0f}s 后开始自动重连"
+        )
+        while not self._reconnect_stop.is_set():
+            if not td.account_id:
+                self.write_log("自动重连中止：资金账号为空，请检查连接配置")
+                return
+            if self._reconnect_stop.wait(delay):
+                return
+
+            self._reconnect_attempt += 1
+            try:
+                td.close()          # 释放旧管道，避免占着半死连接
+            except Exception as ex:  # noqa: BLE001
+                self.write_log(f"重连前关闭旧连接异常（忽略）：{type(ex).__name__}: {ex}")
+
+            try:
+                result: int = td.connect(td.account_id, td.account_type)
+            except Exception as ex:  # noqa: BLE001 - 重连本身失败也要继续退避重试
+                result = -1
+                self.write_log(
+                    f"交易通道第 {self._reconnect_attempt} 次重连异常："
+                    f"{type(ex).__name__}: {ex}"
+                )
+
+            if result == 0 and td.connected:
+                self.write_log(
+                    f"交易通道重连成功（第 {self._reconnect_attempt} 次），"
+                    "定时查询与推送已恢复"
+                )
+                self._reconnect_attempt = 0
+                return
+
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+            self.write_log(
+                f"交易通道第 {self._reconnect_attempt} 次重连失败，"
+                f"{delay:.0f}s 后重试"
+            )
+
+    def stop_reconnect(self) -> None:
+        """停止自动重连（网关关闭时调用）。"""
+        self._reconnect_stop.set()
 
     def init_query(self) -> None:
         """初始化查询任务"""
@@ -721,11 +872,21 @@ class XtMdApi:
             subscribers: set[tuple[str, str]] = self.subscribers.setdefault(xt_symbol, set())
             subscribers.add(subscriber)
 
-            subscription_id: int = xtdata.subscribe_quote(
-                stock_code=xt_symbol,
-                period="tick",
-                callback=self.onMarketData
-            )
+            try:
+                subscription_id: int = xtdata.subscribe_quote(
+                    stock_code=xt_symbol,
+                    period="tick",
+                    callback=self.onMarketData
+                )
+            except Exception as ex:  # noqa: BLE001 - 管道异常不能冒到调用方线程
+                subscribers.discard(subscriber)
+                if not subscribers:
+                    self.subscribers.pop(xt_symbol, None)
+                self.gateway.write_log(
+                    f"行情订阅异常（已在网关内隔离）：{xt_symbol} "
+                    f"{type(ex).__name__}: {ex}"
+                )
+                return
 
             # XT返回值大于0才表示订阅成功。失败时回滚订阅者记录，避免留下脏状态。
             if subscription_id <= 0:
@@ -775,7 +936,13 @@ class XtMdApi:
             self.subscribers.pop(xt_symbol)
             subscription_id: int | None = self.subscription_ids.pop(xt_symbol, None)
             if subscription_id is not None:
-                xtdata.unsubscribe_quote(subscription_id)
+                try:
+                    xtdata.unsubscribe_quote(subscription_id)
+                except Exception as ex:  # noqa: BLE001 - 退订失败不影响本地状态清理
+                    self.gateway.write_log(
+                        f"行情退订异常（已在网关内隔离）：{xt_symbol} "
+                        f"{type(ex).__name__}: {ex}"
+                    )
 
             self.subscribed.discard(xt_symbol)
             self.last_volume.pop(req.vt_symbol, None)
@@ -829,18 +996,14 @@ class XtTdApi(XtQuantTraderCallback):
         self.gateway.write_log("交易接口连接成功")
 
     def on_disconnected(self) -> None:
-        """连接断开"""
+        """连接断开：交给网关按退避重连。
+
+        原来是「在回调线程里同步重连一次」，失败就再也不试，且重连期间会阻塞
+        回调线程；现在统一下沉到网关的重连循环（换新 session_id、指数退避、可停止）。
+        """
         self.gateway.write_log("交易接口连接断开，请检查与客户端的连接状态")
         self.connected = False
-
-        # 尝试重连，重连需要更换session_id
-        session: int = int(float(datetime.now().strftime("%H%M%S.%f")) * 1000)
-        connect_result: int = self.connect(self.account_id, self.account_type, session)
-
-        if connect_result:
-            self.gateway.write_log("交易接口重连失败")
-        else:
-            self.gateway.write_log("交易接口重连成功")
+        self.gateway.start_reconnect("交易接口断开回调")
 
     def on_stock_trade(self, xt_trade: XtTrade) -> None:
         """成交变动推送"""
@@ -1055,6 +1218,7 @@ class XtTdApi(XtQuantTraderCallback):
         subscribe_result: int = self.xt_client.subscribe(self.xt_account)
         if subscribe_result:
             self.gateway.write_log("交易推送订阅失败")
+            self.connected = False      # 推送没订上，视为连接不可用，交给重连循环重试
             return -1
 
         self.gateway.write_log("交易推送订阅成功")
@@ -1131,7 +1295,14 @@ class XtTdApi(XtQuantTraderCallback):
                 order_remark=orderid
             )
         except Exception as ex:
-            self.gateway.write_log(f"委托请求发送异常：{ex}")
+            log_query_error = getattr(self.gateway, "_log_query_error", None)
+            if callable(log_query_error):
+                # 传输层故障会触发自动重连；日志由网关统一限流输出，避免重复两行
+                log_query_error("send_order", ex)
+            else:
+                self.gateway.write_log(
+                    f"委托请求发送异常：{type(ex).__name__}: {ex}"
+                )
             return ""
 
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
@@ -1157,20 +1328,31 @@ class XtTdApi(XtQuantTraderCallback):
         else:
             market = 1
 
-        self.xt_client.cancel_order_stock_sysid_async(self.xt_account, market, sysid)
+        self._safe_query(
+            "cancel_order",
+            lambda: self.xt_client.cancel_order_stock_sysid_async(
+                self.xt_account, market, sysid
+            ),
+        )
 
     def query_position(self) -> None:
         """查询持仓"""
         if self.connected:
-            self.xt_client.query_stock_positions_async(
-                self.xt_account, callback=self.on_query_positions_async
+            self._safe_query(
+                "query_position",
+                lambda: self.xt_client.query_stock_positions_async(
+                    self.xt_account, callback=self.on_query_positions_async
+                ),
             )
 
     def query_account(self) -> None:
         """查询账户资金"""
         if self.connected:
-            self.xt_client.query_stock_asset_async(
-                self.xt_account, callback=self.on_query_asset_async
+            self._safe_query(
+                "query_account",
+                lambda: self.xt_client.query_stock_asset_async(
+                    self.xt_account, callback=self.on_query_asset_async
+                ),
             )
 
     def query_order(self) -> None:
@@ -1178,21 +1360,45 @@ class XtTdApi(XtQuantTraderCallback):
         if self.connected:
             # 必须用 callback=：大 QMT 兼容层第二参是 cancelable_only，
             # 位置传回调会变成 True 且永远不触发 on_query_order_async。
-            self.xt_client.query_stock_orders_async(
-                self.xt_account, callback=self.on_query_order_async
+            self._safe_query(
+                "query_order",
+                lambda: self.xt_client.query_stock_orders_async(
+                    self.xt_account, callback=self.on_query_order_async
+                ),
             )
 
     def query_trade(self) -> None:
         """查询成交信息"""
         if self.connected:
-            self.xt_client.query_stock_trades_async(
-                self.xt_account, callback=self.on_query_trades_async
+            self._safe_query(
+                "query_trade",
+                lambda: self.xt_client.query_stock_trades_async(
+                    self.xt_account, callback=self.on_query_trades_async
+                ),
             )
+
+    def _safe_query(self, name: str, func: Callable) -> None:
+        """查询异常在本层吃掉（管道超时不能让事件引擎线程或调用方崩掉）。"""
+        try:
+            func()
+        except Exception as ex:  # noqa: BLE001 - 见上
+            log_query_error = getattr(self.gateway, "_log_query_error", None)
+            if callable(log_query_error):
+                log_query_error(name, ex)
+            else:
+                self.gateway.write_log(f"查询 {name} 异常：{type(ex).__name__}: {ex}")
 
     def close(self) -> None:
         """关闭连接"""
-        if self.inited:
-            self.xt_client.stop()
+        if self.inited and self.xt_client is not None:
+            try:
+                self.xt_client.stop()
+            except Exception as ex:  # noqa: BLE001 - 关闭阶段的管道异常不再外抛
+                self.gateway.write_log(
+                    f"关闭交易连接异常（已隔离）：{type(ex).__name__}: {ex}"
+                )
+        self.inited = False
+        self.connected = False
 
 
 def _as_tick_list(buf: Any) -> list[dict]:
