@@ -21,6 +21,7 @@ class FakeXtData:
     def __init__(self, only_none: bool = True) -> None:
         self.calls: list[tuple[str, str, str]] = []
         self.heals: list[bool] = []
+        self.subscriptions: list[bool | None] = []
         self.only_none = only_none
 
     def get_instrument_detail(self, code: str) -> dict:
@@ -37,10 +38,12 @@ class FakeXtData:
         dividend_type="none",
         fill_data=False,
         heal=True,
+        subscribe=None,
     ) -> dict:
         code: str = list(stock_list or [""])[0]
         self.calls.append((code, period, dividend_type))
         self.heals.append(heal)
+        self.subscriptions.append(subscribe)
         if self.only_none and dividend_type != "none":
             return {code: DataFrame()}
         return {
@@ -93,6 +96,7 @@ def test_index_query_uses_no_adjustment(monkeypatch) -> None:
     assert fake.calls == [("000001.SH", "1d", "none")], fake.calls
     # 只读本地库，绝不触发桥侧自愈下载（否则单只指数读空会卡 60s+）
     assert fake.heals == [False], fake.heals
+    assert fake.subscriptions == [False], fake.subscriptions
 
 
 def test_stock_query_keeps_forward_adjustment(monkeypatch) -> None:
@@ -106,6 +110,7 @@ def test_stock_query_keeps_forward_adjustment(monkeypatch) -> None:
     )
 
     assert fake.calls == [("600000.SH", "1d", xt_datafeed.DIVIDEND_TYPE)], fake.calls
+    assert fake.subscriptions == [False], fake.subscriptions
 
 
 def test_empty_frame_retries_with_no_adjustment(monkeypatch) -> None:
@@ -122,3 +127,4 @@ def test_empty_frame_retries_with_no_adjustment(monkeypatch) -> None:
     assert [call[2] for call in fake.calls] == [xt_datafeed.DIVIDEND_TYPE, "none"], (
         fake.calls
     )
+    assert fake.subscriptions == [False, False], fake.subscriptions

@@ -404,6 +404,7 @@ def get_history_df(
             count=-1,
             dividend_type=dividend_type,
             fill_data=False,
+            subscribe=False,
             # 只读本地库，不触发桥侧的"自愈下载"：heal=True 时单只标的读空会
             # 现发一次 download_history_data2（RPC 最长等 60s）再重查，选一只
             # 指数就能把界面卡掉一两分钟。补数走 download_bar_history 显式触发。
@@ -421,6 +422,7 @@ def get_history_df(
                 count=-1,
                 dividend_type=dividend_type,
                 fill_data=False,
+                subscribe=False,
             ) or {}
         except Exception as ex:
             output(
